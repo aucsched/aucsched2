@@ -1,0 +1,20 @@
+--- src/slurmctld/job_scheduler.c	2013-01-17 16:00:47.000000000 +0200
++++ src/slurmctld/job_scheduler.c	2013-01-17 16:02:02.000000000 +0200
+@@ -771,7 +771,7 @@
+ 		job_queue = build_job_queue(false);
+ 		slurmctld_diag_stats.schedule_queue_len = list_count(job_queue);
+ 	}
+-	while (1) {
++	while (0) {
+ 		if (fifo_sched) {
+ 			if (job_ptr && part_iterator &&
+ 			    IS_JOB_PENDING(job_ptr)) /*started in other part?*/
+@@ -914,7 +914,7 @@
+ 			       "Priority=%u.",
+ 			       job_ptr->job_id,
+ 			       job_state_string(job_ptr->job_state),
+-			       job_reason_string(job_ptr->state_reason),
++ 			       job_reason_string(job_ptr->state_reason),
+ 			       job_ptr->priority);
+ 			continue;
+ 		}

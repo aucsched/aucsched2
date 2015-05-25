@@ -1,0 +1,16 @@
+--- src/plugins/select/Makefile.am	2013-01-17 16:05:04.000000000 +0200
++++ src/plugins/select/Makefile.am	2013-01-17 16:05:39.000000000 +0200
+@@ -4,7 +4,7 @@
+ BLUEGENE = bluegene
+ endif
+ 
+-SUBDIRS = $(BLUEGENE) cons_res cray linear serial
++SUBDIRS = $(BLUEGENE) cons_res cray linear serial lpconsres
+ 
+ # Each plugin here needs a plugin_id, here are the currect plug_ids
+ # for each plugin.
+@@ -16,3 +16,4 @@
+ # cray + linear   = 104
+ # cray + cons_res = 105 ==> Not current possible on Cray with ALPS/BASIL.
+ # serial          = 106
++# lpconsres	  = 109

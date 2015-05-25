@@ -1,0 +1,20 @@
+--- configure.ac	2013-01-16 11:49:54.000000000 +0200
++++ configure.ac.new	2013-01-16 11:50:48.000000000 +0200
+@@ -486,6 +486,7 @@
+ 		 src/plugins/proctrack/sgi_job/Makefile
+ 		 src/plugins/proctrack/lua/Makefile
+ 		 src/plugins/sched/Makefile
++                 src/plugins/sched/aucsched/Makefile
+ 		 src/plugins/sched/backfill/Makefile
+ 		 src/plugins/sched/builtin/Makefile
+ 		 src/plugins/sched/hold/Makefile
+@@ -498,7 +499,8 @@
+ 		 src/plugins/select/bluegene/bl/Makefile
+ 		 src/plugins/select/bluegene/bl_bgq/Makefile
+ 		 src/plugins/select/bluegene/sfree/Makefile
+-		 src/plugins/select/cons_res/Makefile
++                 src/plugins/select/cons_res/Makefile
++		 src/plugins/select/lpconsres/Makefile
+ 		 src/plugins/select/cray/Makefile
+ 		 src/plugins/select/cray/libalps/Makefile
+ 		 src/plugins/select/cray/libemulate/Makefile
