@@ -46,22 +46,22 @@
 
 /* run every 5 seconds */
 #ifndef SCHED_INTERVAL
-#  define SCHED_INTERVAL	3
+#  define SCHED_INTERVAL	5
 #endif
 
-/* max # of jobs = 100 */
-/* max # of bids = 150 */
+/* max # of jobs = 20 */
+/* max # of bids = 15000 */
 #ifndef MAX_JOB_COUNT
-#define   MAX_JOB_COUNT 100
+#define   MAX_JOB_COUNT 50
 #endif
 
 #ifndef MAX_BID_COUNT
-#define   MAX_BID_COUNT 250
+#define   MAX_BID_COUNT 150000
 #endif
 
 #define SLURMCTLD_THREAD_LIMIT	5
 
-extern int gres_job_gpu_count(List job_gres_list);
+extern int gres_job_gpu_count(List job_gres_list, int *gpu, int *gpu_max);
 static char cplex_license_address[256];
 extern int solve_allocation(int m, int n, int timeout, 
 			sched_nodeinfo_t *node_array, 
@@ -384,38 +384,58 @@ static int _run_solver_opt(void)
 				sjob_ptr->job_id, min_nodes, max_nodes, sjob_ptr->min_nodes);
 		}
 		sjob_ptr->contiguous = job_ptr->details->contiguous;
-		sjob_ptr->gpu = gres_job_gpu_count(job_ptr->gres_list);
+		gres_job_gpu_count(job_ptr->gres_list, &sjob_ptr->gpu, &sjob_ptr->gpu_max);
+		if (sjob_ptr->gpu_max == 0) {
+			sjob_ptr->gpu_max = sjob_ptr->gpu;
+		}
+		if (sjob_ptr->gpu == 0) {
+			sjob_ptr->gpu_max = 0;
+		}
 		sjob_ptr->min_cpus = job_ptr->details->min_cpus;
 		sjob_ptr->cpus_per_node = job_ptr->details->ntasks_per_node *
 						job_ptr->details->cpus_per_task;
+		sjob_ptr->exclusive = (job_ptr->details->shared == 0);
+		debug2("job exclusive flag: %d shared flag: %d",sjob_ptr->exclusive, job_ptr->details->shared);
+
 		if (sjob_ptr->cpus_per_node > 0) {
 			sjob_ptr->max_cpus = MIN(job_ptr->details->max_cpus,sjob_ptr->cpus_per_node * sjob_ptr->max_nodes);
 		} else {
 			sjob_ptr->max_cpus = sjob_ptr->min_cpus;
 		}
+
 		sjob_ptr->priority = job_ptr->priority;
 
-		debug3("job %d id: %d min_cpus: %d max_cpus: %u cpus_per_node %d min_nodes: %d max_nodes: %d gpu: %d, prio: %d",
+		debug("job %d id: %d min_cpus: %d max_cpus: %u cpus_per_node %d min_nodes: %d max_nodes: %d gpu: %d, gpu_max: %d, prio: %d",
 			solver_job_idx-1, sjob_ptr->job_id, sjob_ptr->min_cpus, sjob_ptr->max_cpus,
-			sjob_ptr->cpus_per_node, sjob_ptr->min_nodes, sjob_ptr->max_nodes, sjob_ptr->gpu,sjob_ptr->priority);
+			sjob_ptr->cpus_per_node, sjob_ptr->min_nodes, sjob_ptr->max_nodes, sjob_ptr->gpu,
+			sjob_ptr->gpu_max, sjob_ptr->priority);
 		if (solver_job_idx >= max_job_count)
 			break;
 	}
 	debug("job_list_size: %d",job_list_size);
 	node_array = _print_nodes_inaucsched(avail_bitmap,cg_node_bitmap);
 	debug3("before allocation, heres the result:");
-	/*
+	
 	for (i=0;i<node_record_count;i++)
 		debug3("aucschedde node %d remgpu %u remcpu %u",
 			i,node_array[i].rem_gpus,node_array[i].rem_cpus);
-	*/
+
+	uint32_t diffPrio = 1 - job_list[job_list_size - 1].priority;
+	for (i = 0; i < job_list_size; i++) {
+		job_list[i].priority += diffPrio;
+	}
+	
 	solution_status = solve_allocation(node_record_count, job_list_size, 
 		sched_interval, node_array, job_list, max_bid_count);
 	if (solution_status == 2) {
 		max_bid_count = (int)(max_bid_count/1.5);
 		return 0;
 	}
-	if (solution_status)
+	else if (!solution_status) {
+		max_bid_count = (int)(max_bid_count*1.5);
+		if (max_bid_count > MAX_BID_COUNT)
+			max_bid_count = MAX_BID_COUNT;
+	} else // if (solution_status)
 		return 0;
 	/*	
 	debug3("xafter allocation, heres the result:");
@@ -504,13 +524,16 @@ struct sched_nodeinfo* _print_nodes_inaucsched(bitstr_t *avail_bitmap,
 			}
 			node_array[i].rem_gpus = nodeinfo->rem_gpus;
 			node_array[i].rem_cpus = nodeinfo->rem_cpus;
-			
+			node_array[i].allocated = (nodeinfo->alloc_cpus > 0);
+			/*
 			info("node %d cpu %u",i,node_record_table_ptr[i].cpus);
 			info("aucschedde alloc cpu in node %d is %u, rem_gpu %u",
 				i,nodeinfo->alloc_cpus,nodeinfo->rem_gpus); 
+			*/
 			
 		} else {
 			node_array[i].rem_cpus = 0;
+			node_array[i].allocated = true;
 			node_array[i].rem_gpus = 0;
 		}
 	}

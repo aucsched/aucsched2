@@ -1,12 +1,11 @@
 #include <solver_cplex.h>
 #include <math.h>
 
-#define MAXBIDPERJOB 15
-#define MAXBIDS 250
+#define MAXBIDPERJOB 1000
 #define MAXJOBNODE 5120000
 
-#define MAXCLASSESPERJOB 500
-#define MAXCLASSES 100000
+#define MAXCLASSESPERJOB 50000
+#define MAXCLASSES 1000000
 #define MAXINTERVALS 1000000
 
 #define NONCONTIGLEVEL 100
@@ -32,7 +31,8 @@ typedef struct bid_t {
 	int numNodes;
 	int firstNode;
 	int lastNode;
-	double priority;
+	int gpu;
+	uint32_t priority;
 	double preference;
 } bid;
 
@@ -68,20 +68,6 @@ typedef struct class_t {
 	bool isAligned;
 } class;
 
-/* sil */
-typedef struct class_type_t {
-	int gpn;
-	int cpn;
-	struct class_t *first;
-} class_type;
-
-/* sil */
-typedef struct nodemap_t {
-	int begin;
-	int end;
-	struct nodemap_t *next;
-} nodemap;
-
 /* holds the LAST element's index for a specific CPN/GPN class exists */
 int *cidxArray;
 /* same for class union list */
@@ -89,6 +75,17 @@ int *cuidxArray;
 /* same for class-node list */
 int *nidxArray;
 int *nArray; 
+
+/* aucsched 2 addition */
+int *T;
+sched_nodeinfo_t* node_array;
+solver_job_list_t* job_array;
+int nodeSize;
+int windowSize;
+
+/* aucsched 2 addition */
+extern int gres_job_gpu_set(List job_gres_list, int gpu);
+
 
 double alpha;
 
@@ -113,45 +110,96 @@ sched_nodeinfo_t* temp_node_array;
 /* generate bid for a specific job and class */
 
 
-double preferenceCalculation(int numNodes, int nodeSize, int numNodesets, int nodesetSize, double c1, double c2, double c3) {
-        double ret = 1.0;
+double preferenceCalculation(int numNodes, int numNodesets, int nodesetSize, 
+				double c1, double c2, double c3, int g, int gmax) {
+        double c4 = 0.001;
+        double ret = 1.0 + c4;
+	//ret -= (c4 * (gmax + 1) / (g + 1));
+	ret -= (c4 * (gmax - g) / (gmax + 1));
+        debug4("c4: %.4f g: %d gmax: %d, current ret: %.4f", c4, g, gmax, ret);
         ret -= (c1 + c2 * numNodes / (1 + nodeSize) + c3 * numNodesets / (1 + nodesetSize));
-        debug4("c1 %.2f c2 %.2f c3 %.2f numNodes %d nodeSize %d numNodesets %d nodesetSize %d, returning %.2f",
+        debug4("c1 %.2f c2 %.2f c3 %.2f numNodes %d nodeSize %d numNodesets %d nodesetSize %d, returning %.4f",
                 c1, c2, c3, numNodes, nodeSize, numNodesets, nodesetSize, ret);
         return ret;
 }
 
-int newBid(int amount, int jobIdx, int cIdx, double priority, double preference, int numNodes, int *_nodes, solver_job_list_t *job_array)
+int newBid(int amount, int jobIdx, int cIdx, uint32_t priority, double preference, int numNodes, int *_nodes, int gpu)
 {	
+	int coresPerNode = 0, remaining = amount, k;
+	bid *bidPtr;
         if (bidCtr < maxBids) {
+		bidPtr = &bids[bidCtr];
 	        int i, ok = 1;
         	for (i = job_array[jobIdx].firstBid; i < bidCtr; i++) {
 	                if (cIdx == bids[i].class) {
-	                        debug3("job %d has already a bid on class %d, skipping",
+	                        debug5("job %d has already a bid on class %d, skipping",
 	                                job_array[jobIdx].job_id, cIdx);
                                 return 0;
                         }
                 }
         	if (ok) {
-                debug3("creating bid for job %d, class %d, numnodes %d, last of nodes %d",
+                debug4("creating bid for job %d, class %d, numnodes %d, last of nodes %d",
                         jobIdx, cIdx, numNodes, _nodes[numNodes - 1]);
         	bids[bidCtr].class = cIdx;
-        	bids[bidCtr].amount = amount;
+        	bids[bidCtr].amount = MIN(amount, job_array[jobIdx].min_cpus);
         	bids[bidCtr].jobIdx = jobIdx;
         	bids[bidCtr].priority = priority;
         	bids[bidCtr].preference = preference;
         	bids[bidCtr].numNodes = numNodes;
         	bids[bidCtr].firstNode = jobNodeCtr;
-        	for (i = 0; i < numNodes; i++) {
-	                debug3("job %d bidding on node %d (%d) bid id %d",jobIdx,_nodes[i],jobNodeName[jobNodeCtr],bidCtr+1);
-	                jobNodeName[jobNodeCtr] = _nodes[i];
-                	jobNodeIdx[jobNodeCtr] = jobNodeCtr;
-	        	jobNodeCtr++;
-                	nArray[_nodes[i]]++;
-        	}
-        	bids[bidCtr].lastNode = jobNodeCtr;
-        	debug("created bid no %d, class %d, job %d, numNodes %d firstNode %d lastNode %d, prio: %.2f, pref: %.2f",
-                      bidCtr, cIdx, jobIdx, numNodes, bids[bidCtr].firstNode, bids[bidCtr].lastNode, priority, preference);
+		bids[bidCtr].gpu = gpu;
+                if (job_array[jobIdx].cpus_per_node > 0) {
+			coresPerNode = job_array[jobIdx].cpus_per_node;
+		}
+		
+		bidPtr->lastNode = bidPtr->firstNode + numNodes;
+		for (i = bidPtr->firstNode; i < bidPtr->lastNode; i++) {
+			k = i - bidPtr->firstNode;
+
+			debug5("jobNodeCtr %d",jobNodeCtr);
+			debug5("_nodes[k] %d",_nodes[k]);
+			debug5("jobNodeIdx[jobNodeCtr] %d", jobNodeIdx[jobNodeCtr]);
+			debug5("nArray[_nodes[k]] %d", nArray[_nodes[k]]);
+
+                        jobNodeName[jobNodeCtr] = _nodes[k];
+                        jobNodeIdx[jobNodeCtr] = jobNodeCtr;
+
+			T[i] = 1;
+			remaining--;
+                        debug5("job %d bidding on node %d (%d) bid id %d, nArray element %d",jobIdx,_nodes[k],jobNodeName[jobNodeCtr],bidCtr+1,nArray[_nodes[k]]);
+
+                        jobNodeCtr++;
+                        nArray[_nodes[k]]++;
+
+			if (remaining == 0) {
+				debug5("remaining 0");
+				bidPtr->lastNode = i + 1;
+				bidPtr->numNodes = bidPtr->lastNode - bidPtr->firstNode;
+				break;
+			}
+		}
+
+		debug2("job %d bid on nodes completed moving to core dist", jobIdx);
+
+		if (coresPerNode > 0) {
+			for (i = bidPtr->firstNode; i < bidPtr->lastNode; i++) {
+				int min_val = MIN(coresPerNode - 1, remaining);
+				T[i] += min_val;
+				remaining -= min_val;
+			}
+		} else {
+	                /* block distribution */
+        	        /* cores per node not enabled */
+                        for (i = bidPtr->firstNode; i < bidPtr->lastNode; i++) {
+				k = i - bidPtr->firstNode;
+                                int min_val = MIN(node_array[_nodes[k]].rem_cpus - 1, remaining);
+                                T[i] += min_val;
+                                remaining -= min_val;
+                        }
+		}
+
+        	debug("created bid no %d, class %d, job %d, numNodes %d firstNode %d lastNode %d, prio: %d, pref: %.4f, gpu %d ",
+                      bidCtr, cIdx, jobIdx, numNodes, bids[bidCtr].firstNode, bids[bidCtr].lastNode, priority, preference, gpu);
                       bidCtr++;
         	if (jobNodeCtr >= MAXJOBNODE)
 	              maxBids = bidCtr;
@@ -163,7 +211,7 @@ int newBid(int amount, int jobIdx, int cIdx, double priority, double preference,
         }
 }
 
-void cumSumGeneration(int nodeSize, sched_nodeinfo_t *node_array)
+void cumSumGeneration()
 {
 	int g, i, k;
 	for (i = 0; i < nodeSize; i++) {
@@ -186,20 +234,23 @@ void cumSumGeneration(int nodeSize, sched_nodeinfo_t *node_array)
 				cumsum[g * (nodeSize + 1) + i] = cumsum[g * (nodeSize + 1) + i - 1];
 		}
 		
-		debug3("last element of cumsum with gpu %d is %d",g,cumsum[(g + 1) * (nodeSize + 1) - 1]);
+		debug("last element of cumsum with gpu %d is %d",g,cumsum[(g + 1) * (nodeSize + 1) - 1]);
 		
 		k = g * (nodeSize + 1); // k is starting point
 		while (k < (g + 1) * (nodeSize + 1)) {
-		        // find the beginning point 'k', where 'k+1' has higher cumsum then k.
+		        // find the beginning point 'k' of interval, where 'k+1' has higher cumsum then k.
                         if ( (k <= (g + 1) * (nodeSize + 1)) && (cumsum[k + 1] - cumsum[k] == 0) ) {
                                 k++;
                                 continue;
                         }
+			// find the ending point 'i' of interval, where 'i+1' has equal cumsum to 'i'
 	 		for (i = k; i < (g + 1) * (nodeSize + 1); i++) {
                         	if ( (cumsum[i + 1] - cumsum[i] <= 0) || 
                         	     ( (i + 1 == (g + 1) * (nodeSize + 1)) && (cumsum[i] - cumsum[i - 1] > 0 ) ) ) {
                         	        intervals[intervalCtr].begin = k - g * (nodeSize + 1);
                                 	intervals[intervalCtr].end = i - g * (nodeSize + 1) - 1;
+					if (intervals[intervalCtr].end < intervals[intervalCtr].begin)
+						continue;
                                 	intervals[intervalCtr].numnodes = i - k;
 					//intervals[intervalCtr].nodes = (int *)malloc(intervals[intervalCtr].numnodes * sizeof(int));
 					//for (p = 0; p < intervals[intervalCtr].numnodes; p++) {
@@ -208,7 +259,7 @@ void cumSumGeneration(int nodeSize, sched_nodeinfo_t *node_array)
                                         //}
                                 	intervals[intervalCtr].size = cumsum[i] - cumsum[k];
                                 	intervals[intervalCtr].gpu = g;
-                                	debug3("new interval 1, intervalCtr %d, begin %d , end %d",
+                                	debug5("new interval 1, intervalCtr %d, begin %d , end %d",
                                                 intervalCtr, intervals[intervalCtr].begin, intervals[intervalCtr].end);
                                 	k = i + 1; 
                                 	intervalCtr++;
@@ -222,179 +273,80 @@ void cumSumGeneration(int nodeSize, sched_nodeinfo_t *node_array)
         
         /* interval debug lines */
         for (i = 0; i < intervalCtr; i++) {
-                debug3("interval id: %d, begin: %d, end: %d, size: %d, numnodes: %d, gpu: %d",
+                debug("interval id: %d, begin: %d, end: %d, size: %d, numnodes: %d, gpu: %d",
                         i, intervals[i].begin, intervals[i].end, intervals[i].size,
                         intervals[i].numnodes, intervals[i].gpu);
         }
         
-	/* debug lines */
-	//for (i = 0; i < (nodeSize + 1) * (1 + max_gpu); i++) {
-	//        debug3("i %d, cumsum %d", i, cumsum[i]);
-	//}
-      
 }
-
-// slurm bids
-/*
-void slurmBids(solver_job_list_t *job_array, int nodeSize, int windowSize, sched_nodeinfo_t *node_array) {
-        int job_idx;
-        int i; // interval idx
-        int ret; // dummy to hold return value from select_p_job_test
-        bitstr_t *avail_bitmap = bit_alloc (nodeSize);
-        bitstr_t *bitmap = bit_alloc (nodeSize);
-        for (i = 0; i < nodeSize; i++) {
-                bit_set (bitmap, (bitoff_t) (i));
-                bit_set (avail_bitmap, (bitoff_t) (i));
-        }
-        char *avail_nodelist, *nodelist;
-        nodelist = bitmap2node_name(bitmap);
-        avail_nodelist = bitmap2node_name(avail_bitmap);
-        debug("in slurmBids; avail_bitmap: %s, bitmap: %s", avail_nodelist, nodelist);
-                                
-        for (job_idx = 0; job_idx < windowSize; job_idx++) {                                        
-                for (i = 0; i < intervalCtr; i++) {
-                        if ( (intervals[i].gpu == job_array[job_idx].gpu) &&
-                        	(intervals[i].size >= job_array[job_idx].min_cpus) &&
-                        	(intervals[i].numnodes >= job_array[job_idx].min_nodes) ) {
-                                ret = select_g_job_test(job_array[job_idx].job_ptr, bitmap,
-                                        job_array[job_idx].min_nodes, job_array[job_idx].max_nodes,
-                                        job_array[job_idx].min_nodes, SELECT_MODE_WILL_RUN,
-                                        NULL, NULL);
-                                if (ret == 0) {
-                                        nodelist = bitmap2node_name(bitmap);
-                                        debug3("in slurmBids; job_test for job %d returned %s", job_idx, nodelist);
-                                        // buraya bid olusturmak gerekli, bitmap'teki nodelara gore.
-                                        // sonra da avail bitmap update
-                                } else {
-                                        debug3("in slurmBids; job_test for job %d returned false value %d", job_idx, ret);
-                                }
-                        }
-                }
-        }
-}
-*/
 
 // class generation for node-only jobs
-void classGenerationN(solver_job_list_t *job_array, int job_idx, int nodeSize, sched_nodeinfo_t *node_array) 
+void classGenerationN(int job_idx) 
 { 
         int i, j, k, l, cores, m, p, end_node, ret;
         int firstContigClass, firstClass, lastClass, lastContClass, lastAlignedClass, numClass;
         bool ok;
-	debug3("entering classmap loop, classmapctr %d",classMapCtr);
+	debug4("entering classmap loop, classmapctr %d",classMapCtr);
         interval temp;
         int *nodes = (int *)malloc(nodeSize * sizeof(int));
 
 	firstClass = classCtr;
         job_array[job_idx].firstBid = bidCtr;
-        // slurmBids
-/*
-        bitstr_t *bitmap = bit_alloc (nodeSize);
-        for (i = 0; i < nodeSize; i++) {
-                if (temp_node_array[i].rem_cpus > 0) {
-                        debug3("temp node array node %d remcpu %d",i,temp_node_array[i].rem_cpus);
-                        bit_set (bitmap, (bitoff_t) (i));
-                }
-        }
-        nodelist = bitmap2node_name(bitmap);
-        debug3("in slurmBids; input to job_test for job %d (%d) input %s",
-                job_array[job_idx].job_id, job_idx, nodelist);
 
-        ret = select_g_job_test(job_array[job_idx].job_ptr, bitmap,
-                job_array[job_idx].min_nodes, job_array[job_idx].max_nodes,
-                job_array[job_idx].min_nodes, SELECT_MODE_WILL_RUN,
-                NULL, NULL);
-        if (ret == 0) {
-                nodelist = bitmap2node_name(bitmap);
-                debug3("in slurmBids; job_test for job %d (%d)returned %s",
-                        job_array[job_idx].job_id, job_idx, nodelist);
-                // buraya bid olusturmak gerekli, bitmap'teki nodelara gore.
-		int sum = 0;
-                for (i = 0; i < nodeSize; i++) {
-                        if (bit_test(bitmap, i)) {
-                                sum += temp_node_array[i].rem_cpus;
-                        }
-                }
-		if (sum >= job_array[job_idx].min_cpus) {
-                int numNodes = bit_set_count(bitmap);
-                int *nodes = (int*)malloc(numNodes * sizeof(int));
-                int j = 0;
-                int contig = 0;
-                for (i = 0; i < nodeSize; i++) {
-                        if (bit_test(bitmap, i)) {
-                                nodes[j] = i;
-                                j++;
-                        }
-                }
-                for (i = 1; i < j; i++) {
-                        if (nodes[i] - nodes[i-1] > 1)
-                                contig++;
-                }
-                debug3("in slurmBids; job_test for job %d is on %d contig parts", job_array[job_idx].job_id, contig);
-                
-                cArray[classCtr].numNodes = numNodes;
-                cArray[classCtr].nodesUsed = (int *)malloc(cArray[classCtr].numNodes * sizeof(int));
-                int classIdx = classCtr++;
-                
-                double priority = job_array[job_idx].priority;
-                int amount = MIN(job_array[job_idx].max_cpus, sum);
-                double preference = preferenceCalculation
-                        (numNodes, nodeSize, contig,
-                        nodesetCount[job_array[job_idx].gpu], 0.5, 0.0, 0.5);
-                newBid(amount, job_idx, classIdx, priority, preference, numNodes, nodes, job_array);
-                // sonra da temp_node_array update
-                for (j = 0; j < numNodes; j++) {
-                        k = nodes[j];
-                        if (job_array[job_idx].cpus_per_node > 0) {
-                                temp_node_array[k].rem_cpus -= job_array[job_idx].cpus_per_node;
-                        } else {
-                                temp_node_array[k].rem_cpus = 0;
-                        }
-                }
-		}
-        } else {
-                debug3("in slurmBids; job_test for job %d returned false value %d", job_idx, ret);
-        }
-*/
         firstContigClass = classCtr;
 	/* contiguous aligned bids */
 	for (i = 0; i < intervalCtr; i++) {
 	        if (classCtr >= MAXCLASSES) {
-			debug3("max number of classes (%d) reached",MAXCLASSES);
+			debug4("max number of classes (%d) reached",MAXCLASSES);
 			break;
 		}		       
-                if ( (intervals[i].gpu == job_array[job_idx].gpu) &&
+		int g = intervals[i].gpu;
+                if ( (g >= job_array[job_idx].gpu) &&
+			(g <= job_array[job_idx].gpu_max) && 
                 	(intervals[i].size >= job_array[job_idx].min_cpus) &&
                 	(intervals[i].numnodes >= job_array[job_idx].min_nodes) ) {
-                        int offset = job_array[job_idx].gpu * (nodeSize + 1);
+                        int offset = g * (nodeSize + 1);
                         // align to beginning of interval
                         k = intervals[i].begin;
                		end_node = MIN(job_array[job_idx].max_nodes, intervals[i].end - k + 1);
                        	cores = cumsum[k + end_node + offset] - cumsum[k + offset];
-                       	debug3("begin node %d end_node %d cores %d ",k,end_node,cores);
+                       	debug4("begin node %d end_node %d cores %d ",k,end_node,cores);
                         if ( (cores >= job_array[job_idx].min_cpus) ) {
                                 ok = true;
-                                if (job_array[job_idx].cpus_per_node > 0)
-                                        for (j = k; j < k + end_node; j++) {
-                                                if (node_array[j].rem_cpus < job_array[job_idx].cpus_per_node) {
-                                                        ok = false;
-                                                }
-                                        }
+                                if (job_array[job_idx].cpus_per_node > 0) 
+								{
+									for (j = k; j < k + end_node; j++) {
+										if (node_array[j].rem_cpus < job_array[job_idx].cpus_per_node) 
+										{
+											ok = false;
+										}
+									}
+								}
+                                if (job_array[job_idx].exclusive) 
+								{
+									for (j = k; j < k + end_node; j++) {
+										if (node_array[j].allocated) 
+										{
+											ok = false;
+										}
+									}
+								}
                                 if (ok) {
-                                        debug3("creating class for cores %d",cores);
+                                        debug4("creating class for cores %d",cores);
                                 	cArray[classCtr].numNodes = end_node;
                                         if (job_array[job_idx].cpus_per_node > 0)
                                         	cArray[classCtr].numCores = end_node * job_array[job_idx].cpus_per_node;
                                         else
                                                 cArray[classCtr].numCores = MIN(cores, job_array[job_idx].max_cpus);
-                                        cArray[classCtr].numGpus = job_array[job_idx].gpu;
+                                        cArray[classCtr].numGpus = g;
                                         cArray[classCtr].nodesUsed = (int *)malloc(cArray[classCtr].numNodes * sizeof(int));
                                         cArray[classCtr].sumBids = 0;
 					cArray[classCtr].preference = preferenceCalculation
-					        (cArray[classCtr].numNodes, nodeSize, 1, 
-					        nodesetCount[cArray[classCtr].numGpus], 0.0, 0.0, 0.0);
+					        (cArray[classCtr].numNodes, 1, nodesetCount[cArray[classCtr].numGpus], 
+						0.0, 0.0, 0.0, g, job_array[job_idx].gpu_max);
                                         for (m = 0; m < cArray[classCtr].numNodes; m++) {
                                         	cArray[classCtr].nodesUsed[m] = k + m;
-                                        	debug3("nodeUsed %d: %d",m,cArray[classCtr].nodesUsed[m]);
+                                        	debug5("nodeUsed %d: %d",m,cArray[classCtr].nodesUsed[m]);
                                         }
                                        	classCtr++;
                                 }
@@ -403,44 +355,54 @@ void classGenerationN(solver_job_list_t *job_array, int job_idx, int nodeSize, s
                         k = intervals[i].end - job_array[job_idx].min_nodes + 1;
                		end_node = MIN(job_array[job_idx].max_nodes, intervals[i].end - k + 1);
                        	cores = cumsum[k + end_node + offset] - cumsum[k + offset];
-                       	debug3("begin node %d end_node %d cores %d ",k,end_node,cores);
+                       	debug4("begin node %d end_node %d cores %d ",k,end_node,cores);
                         if ( (cores >= job_array[job_idx].min_cpus) ) {
                                 ok = true;
-                                if (job_array[job_idx].cpus_per_node > 0)
-                                        for (j = k; j < k + end_node; j++) {
-                                                if (node_array[j].rem_cpus < job_array[job_idx].cpus_per_node) {
-                                                        ok = false;
-                                                }
-                                        }
+                                if (job_array[job_idx].cpus_per_node > 0) 
+								{
+									for (j = k; j < k + end_node; j++) {
+										if (node_array[j].rem_cpus < job_array[job_idx].cpus_per_node) 
+										{
+											ok = false;
+										}
+									}
+								}
+                                if (job_array[job_idx].exclusive) 
+								{
+									for (j = k; j < k + end_node; j++) {
+										if (node_array[j].allocated) 
+										{
+											ok = false;
+										}
+									}
+								}
                                 if (ok) {
-                                        debug3("creating class for cores %d",cores);
+                                        debug4("creating class for cores %d",cores);
                                 	cArray[classCtr].numNodes = end_node;
                                         if (job_array[job_idx].cpus_per_node > 0)
                                         	cArray[classCtr].numCores = end_node * job_array[job_idx].cpus_per_node;
                                         else
                                                 cArray[classCtr].numCores = MIN(cores, job_array[job_idx].max_cpus);
-                                        cArray[classCtr].numGpus = job_array[job_idx].gpu;
+                                        cArray[classCtr].numGpus = g;
                                         cArray[classCtr].nodesUsed = (int *)malloc(cArray[classCtr].numNodes * sizeof(int));
                                         cArray[classCtr].sumBids = 0;
                                         cArray[classCtr].preference = preferenceCalculation
-                                                (cArray[classCtr].numNodes, nodeSize, 1,
-                                                nodesetCount[cArray[classCtr].numGpus], 0.0, 0.0, 0.0);
+                                                (cArray[classCtr].numNodes, 1, nodesetCount[cArray[classCtr].numGpus], 
+						0.0, 0.0, 0.0, g, job_array[job_idx].gpu_max);
                                         for (m = 0; m < cArray[classCtr].numNodes; m++) {
                                         	cArray[classCtr].nodesUsed[m] = k + m;
-                                        	debug3("nodeUsed %d: %d",m,cArray[classCtr].nodesUsed[m]);
+                                        	debug5("nodeUsed %d: %d",m,cArray[classCtr].nodesUsed[m]);
                                         }
                                        	classCtr++;
                                 }
 			}
-
 		}
 	}
-	debug3("created %d aligned contig classes for job %d",classCtr - firstContigClass, job_idx);
 
-	debug3("created %d aligned classes for job %d",classCtr - firstContigClass, job_idx);
+	debug("created %d aligned classes for job %d",classCtr - firstContigClass, job_idx);
         lastAlignedClass = classCtr;
 	i = 0;
-	debug3("trying to create bids for job_idx %d firstContigClass %d lastAlignedClass %d",
+	debug4("trying to create bids for job_idx %d firstContigClass %d lastAlignedClass %d",
 	        job_idx, firstContigClass, lastAlignedClass);
 	numClass = lastAlignedClass - firstContigClass;
 	// the job has numClass classes 
@@ -449,7 +411,7 @@ void classGenerationN(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 	                break;
 		ret = newBid(cArray[j].numCores, job_idx, j,
 			job_array[job_idx].priority, cArray[j].preference, 
-			cArray[j].numNodes, cArray[j].nodesUsed, job_array);
+			cArray[j].numNodes, cArray[j].nodesUsed, cArray[j].numGpus);
                 if (ret <= 0)
                         break;
 	}
@@ -459,48 +421,62 @@ void classGenerationN(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 	// contiguous bids
 	for (i = 0; i < intervalCtr; i++) {
 		if (classCtr >= MAXCLASSES) {
-			debug3("max number of classes (%d) reached",MAXCLASSES);
+			debug4("max number of classes (%d) reached",MAXCLASSES);
 			break;
 		}		       
 		if (classCtr - firstClass >= MAXCLASSESPERJOB) {
-			debug3("max number of classes per job (%d) reached for job %d",MAXCLASSESPERJOB,job_array[job_idx].job_id);
+			debug4("max number of classes per job (%d) reached for job %d",MAXCLASSESPERJOB,job_array[job_idx].job_id);
 			break;
 		}
-                if ( (intervals[i].gpu == job_array[job_idx].gpu) &&
+		int g = intervals[i].gpu;
+                if ( (g >= job_array[job_idx].gpu) &&
+			(g <= job_array[job_idx].gpu_max) && 
                 	(intervals[i].size >= job_array[job_idx].min_cpus) &&
 //                	(intervals[i].size <= job_array[job_idx].max_cpus) &&
                 	(intervals[i].numnodes >= job_array[job_idx].min_nodes) ) {
 //                	(intervals[i].numnodes <= job_array[job_idx].max_nodes) ) {
-                        int offset = job_array[job_idx].gpu * (nodeSize + 1);
+                        int offset = g * (nodeSize + 1);
                       	for (k = intervals[i].begin + 1; k < intervals[i].end - job_array[job_idx].min_nodes + 1; k++) {
                       	        //k = begin_node, starting from interval's initial point
                       	        //end_node, min(k + max_node,intervals[i].end);
                 		if (classCtr >= MAXCLASSES) {
-                			debug3("max number of classes (%d) reached",MAXCLASSES);
+                			debug4("max number of classes (%d) reached",MAXCLASSES);
                 			break;
                 		}		       
                 		if (classCtr - firstClass >= MAXCLASSESPERJOB) {
-                			debug3("max number of classes per job (%d) reached for job %d",MAXCLASSESPERJOB,job_array[job_idx].job_id);
+                			debug4("max number of classes per job (%d) reached for job %d",MAXCLASSESPERJOB,job_array[job_idx].job_id);
                 			break;
                 		}
                 		end_node = MIN(job_array[job_idx].max_nodes, intervals[i].end - k + 1);
                         	cores = cumsum[k + end_node + offset] - cumsum[k + offset];
-                        	debug3("begin node %d end_node %d cores %d ",k,end_node,cores);
+                        	debug4("begin node %d end_node %d cores %d ",k,end_node,cores);
                                 if ( (cores >= job_array[job_idx].min_cpus) ) {
                                         ok = true;
-                                        if (job_array[job_idx].cpus_per_node > 0)
-                                        for (j = k; j < k + end_node; j++) {
-                                                if (node_array[j].rem_cpus < job_array[job_idx].cpus_per_node) {
-                                                        ok = false;
-                                                }
-                                        }
+										if (job_array[job_idx].cpus_per_node > 0) 
+										{
+											for (j = k; j < k + end_node; j++) {
+												if (node_array[j].rem_cpus < job_array[job_idx].cpus_per_node) 
+												{
+													ok = false;
+												}
+											}
+										}
+										if (job_array[job_idx].exclusive) 
+										{
+											for (j = k; j < k + end_node; j++) {
+												if (node_array[j].allocated) 
+												{
+													ok = false;
+												}
+											}
+										}
                                         if (ok) {
                                 	cArray[classCtr].numNodes = end_node;
                                         if (job_array[job_idx].cpus_per_node > 0)
                                         	cArray[classCtr].numCores = end_node * job_array[job_idx].cpus_per_node;
                                         else
                                                 cArray[classCtr].numCores = MIN(cores, job_array[job_idx].max_cpus);
-                                        cArray[classCtr].numGpus = job_array[job_idx].gpu;
+                                        cArray[classCtr].numGpus = g;
                                         cArray[classCtr].nodesUsed = (int *)malloc(cArray[classCtr].numNodes * sizeof(int));
                                         int sum = 0;
                                         for (j = k; j < k + end_node; j++) {
@@ -508,12 +484,12 @@ void classGenerationN(solver_job_list_t *job_array, int job_idx, int nodeSize, s
                                         }
                                         cArray[classCtr].sumBids = sum;
                                         cArray[classCtr].preference = preferenceCalculation
-                                                (cArray[classCtr].numNodes, nodeSize, 1,
-                                                nodesetCount[cArray[classCtr].numGpus], 0.5, 0.0, 0.0);
-                                        debug3("creating class for cores %d pref %.2f",cores,cArray[classCtr].preference);
+                                                (cArray[classCtr].numNodes, 1, nodesetCount[cArray[classCtr].numGpus], 
+						0.5, 0.0, 0.0, g, job_array[job_idx].gpu_max);
+                                        debug4("creating class for cores %d pref %.2f",cores,cArray[classCtr].preference);
                                         for (m = 0; m < cArray[classCtr].numNodes; m++) {
                                         	cArray[classCtr].nodesUsed[m] = k + m;
-                                        	//debug3("nodeUsed %d: %d",m,cArray[classCtr].nodesUsed[m]);
+                                        	//debug5("nodeUsed %d: %d",m,cArray[classCtr].nodesUsed[m]);
                                         }
                                        	classCtr++;
                                        	}
@@ -521,12 +497,12 @@ void classGenerationN(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 			}
 		}
 	}
-	debug3("created %d contig classes for job %d",classCtr - lastAlignedClass, job_idx);
+	debug4("created %d contig classes for job %d",classCtr - lastAlignedClass, job_idx);
 
-	debug3("created %d classes for job %d",classCtr - lastAlignedClass, job_idx);
+	debug4("created %d classes for job %d",classCtr - lastAlignedClass, job_idx);
         lastContClass = classCtr;
 	i = bidCtr - job_array[job_idx].firstBid;
-	debug3("trying to create bids for job_idx %d lastAlignedClass %d lastContClass %d",
+	debug4("trying to create bids for job_idx %d lastAlignedClass %d lastContClass %d",
 	        job_idx, lastAlignedClass, lastContClass);
 	numClass = lastContClass - lastAlignedClass;
 	// the job has numClass classes 
@@ -540,19 +516,20 @@ void classGenerationN(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 	                for (l = 0; l < k; l++)
 	                        if (contigbids[l] == j)
 	                                continue;
-                        if ((cArray[j].preference >= max_pref) && (cArray[j].sumBids <= max_sum)) {
+			if ((cArray[j].preference >= max_pref) || (cArray[j].sumBids <= max_sum)) {
+//        		if (cArray[j].preference >= max_pref) {
                                 max_pref = cArray[j].preference;
-                                max_sum = cArray[j].sumBids;
+				max_sum = cArray[j].sumBids;
                                 max_pref_idx = j;
                         }	                
                 }
                 if (max_pref_idx == -1) {
                         break;
                 }
-		debug3("class with max pref (%.2f) is %d",max_pref, max_pref_idx);
+		debug4("class with max pref (%.2f) is %d",max_pref, max_pref_idx);
 		ret = newBid(cArray[max_pref_idx].numCores, job_idx, max_pref_idx,
 			job_array[job_idx].priority, cArray[max_pref_idx].preference, 
-			cArray[max_pref_idx].numNodes, cArray[max_pref_idx].nodesUsed, job_array);
+			cArray[max_pref_idx].numNodes, cArray[max_pref_idx].nodesUsed, cArray[max_pref_idx].numGpus);
                 if (ret >= 0) {
                         i++;
                         contigbids[k++] = max_pref_idx;
@@ -574,6 +551,8 @@ void classGenerationN(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 	for (i = 0; i < intervalCtr; i++) {
 		temp.size = intervals[i].size;
 		temp.gpu = intervals[i].gpu;
+		if ( (temp.gpu < job_array[job_idx].gpu) || (temp.gpu > job_array[job_idx].gpu_max) )
+			continue;
 		temp.numnodes = intervals[i].numnodes;
 		temp.begin = intervals[i].begin;
 		temp.end = intervals[i].end;
@@ -582,84 +561,98 @@ void classGenerationN(solver_job_list_t *job_array, int job_idx, int nodeSize, s
         		        fatal("P %d IS GREATER THAN NODESIZE %d",p,nodeSize);
                         nodes[p] = intervals[i].begin + p;
                 }
-                debug3("testing non-contig nodeset starting from interval no %d",i);
+                debug4("testing non-contig nodeset starting from interval no %d",i);
 		int contig = 1;
 		for (j = i + 1; j < intervalCtr; j++) {
 		        if (contig >= NONCONTIGLEVEL) {
-		                debug3("max non contiguity level reached.");
+		                debug4("max non contiguity level reached.");
 		                break;
                         }
 			if (classCtr >= MAXCLASSES) {
-				debug3("max number of classes (%d) reached",MAXCLASSES);
+				debug4("max number of classes (%d) reached",MAXCLASSES);
 				break;
 			}		       
 			if (classCtr - firstClass >= MAXCLASSESPERJOB) {
-				debug3("max number of classes per job (%d) reached for job %d",MAXCLASSESPERJOB,job_array[job_idx].job_id);
+				debug4("max number of classes per job (%d) reached for job %d",MAXCLASSESPERJOB,job_array[job_idx].job_id);
 				break;
 			}
 
 			if (intervals[j].gpu > intervals[i].gpu)
                                 break;
 			if (intervals[j].gpu == intervals[i].gpu) {
-			        debug3("included interval no %d to the nodeset beginning with interval %d",j,i);
+			        debug4("included interval no %d to the nodeset beginning with interval %d",j,i);
 			        contig++;
-			        //debug3("interval %d (%d nodes) and interval %d (%d nodes)have same gpu, combining",
+			        //debug4("interval %d (%d nodes) and interval %d (%d nodes)have same gpu, combining",
 			                 //j,intervals[j].numnodes,i,intervals[i].numnodes);
 				temp.size += intervals[j].size;
-				//debug3("size is now: %d", temp.size);
-				//debug3("realloc'ed nodes");
+				//debug4("size is now: %d", temp.size);
+				//debug4("realloc'ed nodes");
 
 				for (p = 0; p < intervals[j].numnodes; p++) {
-				        //debug3("intervals[%d].nodes(%d) is: %d",j,p,intervals[j].nodes[p]);
+				        //debug5("intervals[%d].nodes(%d) is: %d",j,p,intervals[j].nodes[p]);
                                         nodes[p + temp.numnodes] = intervals[j].begin + p;
                 		        if (p + temp.numnodes > nodeSize)
                 		                fatal("P %d +temp.numnodes %d IS GREATER THAN NODESIZE %d",p,temp.numnodes,nodeSize);
                                         //intervals[j].nodes[p];
-				        //debug3("nodes element %d is %d",p + temp.numnodes,nodes[p + temp.numnodes]);	
-				        //debug3("interval %d nodes %d: %d",j,p,intervals[j].nodes[p]);
+				        //debug5("nodes element %d is %d",p + temp.numnodes,nodes[p + temp.numnodes]);	
+				        //debug5("interval %d nodes %d: %d",j,p,intervals[j].nodes[p]);
                                 }
 				temp.numnodes += intervals[j].numnodes;
-				//debug3("nodes in temp interval: (%d)",temp.numnodes);
+				//debug4("nodes in temp interval: (%d)",temp.numnodes);
 				//xfor (p = 0; p < temp.numnodes; p++)
 				        //xnodes[p] = 1;
 
-		                if ( (temp.gpu == job_array[job_idx].gpu) &&
+				int g = temp.gpu;
+		                if ( (g >= job_array[job_idx].gpu) &&
+					(g <= job_array[job_idx].gpu_max) && 
 	        	        	(temp.size >= job_array[job_idx].min_cpus) &&
 	        		       	(temp.numnodes >= job_array[job_idx].min_nodes) ) {
 		                      	for (k = 0; k < temp.numnodes - job_array[job_idx].min_nodes + 1; k++) {
 		                      	        if (classCtr >= MAXCLASSES) {
-		                      	                debug3("max number of classes (%d) reached",MAXCLASSES);
+		                      	                debug4("max number of classes (%d) reached",MAXCLASSES);
 		                      	                break;
                                                 }
 					       	if (classCtr - firstClass >= MAXCLASSESPERJOB) {
-  				                        debug3("max number of classes per job (%d) reached for job %d",MAXCLASSESPERJOB,job_array[job_idx].job_id);
+  				                        debug4("max number of classes per job (%d) reached for job %d",MAXCLASSESPERJOB,job_array[job_idx].job_id);
                         				break;
 						}
 						cores = 0;
-						//debug3("job id: %d cores for noncontig class creation",job_array[job_idx].job_id);	
+						//debug4("job id: %d cores for noncontig class creation",job_array[job_idx].job_id);	
                                 		end_node = MIN(job_array[job_idx].max_nodes, temp.numnodes - k);
 						for (p = k; p < k + end_node; p++) {
 							cores += node_array[nodes[p]].rem_cpus;
-							//debug3("id: %d node %d remcpu %d total %d",
+							//debug4("id: %d node %d remcpu %d total %d",
 							//p,nodes[p],node_array[nodes[p]].rem_cpus,cores);
 						}
 						//debug("%d segments, %d cores", contig, cores);
 		                                if ( (cores >= job_array[job_idx].min_cpus) ) {
 		                                        ok = true;
-                                                        if (job_array[job_idx].cpus_per_node > 0)
-                                                                for (m = k; m < k + end_node; m++) {
-                                                                        if (node_array[nodes[m]].rem_cpus < job_array[job_idx].cpus_per_node) {
-                                                                                ok = false;
-                                                                        }
-                                                                }
+														if (job_array[job_idx].cpus_per_node > 0) 
+														{
+															for (m = k; m < k + end_node; m++) {
+																if (node_array[nodes[m]].rem_cpus < job_array[job_idx].cpus_per_node) 
+																{
+																	ok = false;
+																}
+															}
+														}
+														if (job_array[job_idx].exclusive) 
+														{
+															for (m = k; m < k + end_node; m++) {
+																if (node_array[nodes[m]].allocated) 
+																{
+																	ok = false;
+																}
+															}
+														}
                                                         if (ok) {
-                                                        debug3("creating class for cores %d",cores);
+                                                        debug4("creating class for cores %d",cores);
                 		                	cArray[classCtr].numNodes = end_node;
                                                         if (job_array[job_idx].cpus_per_node > 0)
                                                         	cArray[classCtr].numCores = end_node * job_array[job_idx].cpus_per_node;
                                                         else
                                                                 cArray[classCtr].numCores = cores;
-		                                        cArray[classCtr].numGpus = job_array[job_idx].gpu;
+		                                        cArray[classCtr].numGpus = g;
                 		                        cArray[classCtr].nodesUsed = (int *)malloc(cArray[classCtr].numNodes * sizeof(int));
                                                         int sum = 0;
                                                         for (m = k; m < k + cArray[classCtr].numNodes; m++) {
@@ -667,10 +660,10 @@ void classGenerationN(solver_job_list_t *job_array, int job_idx, int nodeSize, s
                                                         }
                                                         cArray[classCtr].sumBids = sum;
                                                         cArray[classCtr].preference = preferenceCalculation
-                                                                (cArray[classCtr].numNodes, nodeSize, contig,
-                                                                nodesetCount[cArray[classCtr].numGpus], 0.5, 0.0, 0.5);
+                                                                (cArray[classCtr].numNodes, contig, nodesetCount[cArray[classCtr].numGpus], 
+								0.5, 0.0, 0.5, g, job_array[job_idx].gpu_max);
 		                                        for (m = 0; m < cArray[classCtr].numNodes; m++) {
-		                                                //debug3("trying to access nodes %d : %d",k+m,nodes[k + m]);
+		                                                //debug4("trying to access nodes %d : %d",k+m,nodes[k + m]);
                 		                        	cArray[classCtr].nodesUsed[m] = nodes[k + m];
                                 		       	}
                                 		       	classCtr++;
@@ -683,7 +676,7 @@ void classGenerationN(solver_job_list_t *job_array, int job_idx, int nodeSize, s
                 //free(nodes);
 	}
 	
-	debug3("created %d classes for job %d",classCtr - lastContClass, job_idx);
+	debug5("created %d classes for job %d",classCtr - lastContClass, job_idx);
         lastClass = classCtr;
 	i = bidCtr - job_array[job_idx].firstBid;
 	debug3("trying to create bids for job_idx %d firstContigClass %d lastClass %d",
@@ -712,9 +705,10 @@ void classGenerationN(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 	                for (l = 0; l < k; l++)
 	                        if (noncontigbids[l] == j)
 	                                continue;
-                        if ((cArray[j].preference >= max_pref) && (cArray[j].sumBids <= max_sum)) {
+			if ((cArray[j].preference >= max_pref) || (cArray[j].sumBids <= max_sum)) {
+//sumbids		if (cArray[j].preference >= max_pref) {
                                 max_pref = cArray[j].preference;
-                                max_sum = cArray[j].sumBids;
+				max_sum = cArray[j].sumBids;
                                 max_pref_idx = j;
                         }	                
                 }
@@ -724,7 +718,7 @@ void classGenerationN(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 		debug3("class with maximum preference (%.2f) is %d",max_pref, max_pref_idx);
 		ret = newBid(cArray[max_pref_idx].numCores, job_idx, max_pref_idx,
 			job_array[job_idx].priority, cArray[max_pref_idx].preference, 
-			cArray[max_pref_idx].numNodes, cArray[max_pref_idx].nodesUsed, job_array);
+			cArray[max_pref_idx].numNodes, cArray[max_pref_idx].nodesUsed, cArray[max_pref_idx].numGpus);
                 if (ret >= 0)
                         i++;
                 else if (ret == -1)
@@ -741,7 +735,7 @@ void classGenerationN(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 }
 
 // class generation for core-only jobs
-void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, sched_nodeinfo_t *node_array)
+void classGenerationC(int job_idx)
 { 
         int i, j = 0, k, l, cores, m, p, ret;
         int firstContigClass, firstClass, lastClass, lastContClass, lastAlignedClass, numClass;
@@ -750,89 +744,28 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
         job_array[job_idx].firstBid = bidCtr;
         firstClass = classCtr;
         
-        // slurmBids
-/*
-        bitstr_t *bitmap = bit_alloc (nodeSize);
-        for (i = 0; i < nodeSize; i++) {
-                if (temp_node_array[i].rem_cpus > 0) {
-                        debug3("temp node array node %d remcpu %d",i,temp_node_array[i].rem_cpus);
-                        bit_set (bitmap, (bitoff_t) (i));
-                }
-        }
-        nodelist = bitmap2node_name(bitmap);
-        debug3("in slurmBids; input to job_test for job %d (%d) input %s",
-                job_array[job_idx].job_id, job_idx, nodelist);
-
-        ret = select_g_job_test(job_array[job_idx].job_ptr, bitmap,
-                job_array[job_idx].min_nodes, job_array[job_idx].max_nodes,
-                job_array[job_idx].min_nodes, SELECT_MODE_WILL_RUN,
-                NULL, NULL);
-        if (ret == 0) {
-                nodelist = bitmap2node_name(bitmap);
-                debug3("in slurmBids; job_test for job %d (%d)returned %s",
-                        job_array[job_idx].job_id, job_idx, nodelist);
-                // buraya bid olusturmak gerekli, bitmap'teki nodelara gore.
-                int sum = 0;
-                for (i = 0; i < nodeSize; i++) {
-                        if (bit_test(bitmap, i)) {
-                                sum += temp_node_array[i].rem_cpus;
-                        }
-                }
-                if (sum >= job_array[job_idx].min_cpus) {
-                int numNodes = bit_set_count(bitmap);
-                int *bidNodes = (int*)malloc(numNodes * sizeof(int));
-                int j = 0;
-                int contig = 0;
-                for (i = 0; i < nodeSize; i++) {
-                        if (bit_test(bitmap, i)) {
-                                bidNodes[j] = i;
-                                j++;
-                        }
-                }
-                
-                for (i = 1; i < j; i++) {
-                        if (bidNodes[i] - bidNodes[i-1] > 1)
-                                contig++;
-                }
-                debug3("in slurmBids; job_test for job %d is on %d contig parts", job_array[job_idx].job_id, contig);
-                
-                cArray[classCtr].numNodes = numNodes;
-                cArray[classCtr].nodesUsed = (int *)malloc(cArray[classCtr].numNodes * sizeof(int));
-                int classIdx = classCtr++;
-                
-                double priority = job_array[job_idx].priority;
-                int amount = MIN(job_array[job_idx].max_cpus, sum);
-                double preference = preferenceCalculation
-                        (numNodes, nodeSize, contig,
-                        nodesetCount[job_array[job_idx].gpu], 0.5, 0.0, 0.5);
-                newBid(amount, job_idx, classIdx, priority, preference, numNodes, bidNodes, job_array);
-                // sonra da temp_node_array update
-                for (j = 0; j < numNodes; j++) {
-                        k = bidNodes[j];
-                        if (job_array[job_idx].cpus_per_node > 0) {
-                                temp_node_array[k].rem_cpus -= job_array[job_idx].cpus_per_node;
-                        } else {
-                                temp_node_array[k].rem_cpus = 0;
-                        }
-                }
-		}
-        } else {
-                debug3("in slurmBids; job_test for job %d returned false value %d", job_idx, ret);
-        }
-*/
-        
         debug3("entering interval loop, intervalCtr %d, job id %d",intervalCtr,job_array[job_idx].job_id);
 	firstContigClass = classCtr;
         for (i = 0; i < intervalCtr; i++) {
-                 if (intervals[i].gpu != job_array[job_idx].gpu)
+		int g = intervals[i].gpu;
+                debug3("interval %d gpu %d , job gpu %d-%d",i,g,job_array[job_idx].gpu,job_array[job_idx].gpu_max);		
+                 if ( (g < job_array[job_idx].gpu) || (g > job_array[job_idx].gpu_max) ) {
+			debug2("job %d gpu ([%d-%d] count not applicable to interval %d", 
+				job_idx, job_array[job_idx].gpu, job_array[job_idx].gpu_max, i);
                         continue;
-                 if ( (intervals[i].size < job_array[job_idx].min_cpus) )
-			break;
+		}
+                 if ( (intervals[i].size < job_array[job_idx].min_cpus) ) {
+			debug3("job %d cpu count not applicable to interval %d", job_idx, i);
+			continue;
+		}
+                debug3("sth3 int between %d and %d ",intervals[i].begin, intervals[i].end);
+
 	                 for (k = intervals[i].end; k >= intervals[i].begin; k--) {
                                       if (classCtr >= MAXCLASSES)
                                               break;
                                       if (classCtr - firstClass >= MAXCLASSESPERJOB)
                                               break;
+                        debug3("sth4");
                                       cores = cumsum[intervals[i].end] - cumsum[k - 1];
                                       if ( (cores < job_array[job_idx].min_cpus) || (intervals[i].end + 1 - k > job_array[job_idx].min_cpus)) 
 				   	      continue;
@@ -840,12 +773,12 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 					debug3("generating right-aligned bid for job %d",job_array[job_idx].job_id);
                                         cArray[classCtr].numNodes = intervals[i].end - k + 1;
                                         cArray[classCtr].numCores = cores;
-                                        cArray[classCtr].numGpus = job_array[job_idx].gpu;
+                                        cArray[classCtr].numGpus = g;
                                         debug4("creating nodesUsed size %d",cArray[classCtr].numNodes);
                                         cArray[classCtr].nodesUsed = (int *)malloc(cArray[classCtr].numNodes * sizeof(int));
                                         cArray[classCtr].preference = preferenceCalculation
-                                                      (cArray[classCtr].numNodes, nodeSize, 1,
-                                                      nodesetCount[0], 0.0, 0.25, 0.0);
+                                                      (cArray[classCtr].numNodes, 1, nodesetCount[0], 
+							0.0, 0.25, 0.0, g, job_array[job_idx].gpu_max);
                                         debug4("filling nodesUsed");
                                         for (m = 0; m < cArray[classCtr].numNodes; m++) {
                                                       debug5("nodesUsed element %d is %d",m,k+m);
@@ -854,7 +787,9 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
                                         classCtr++;
                                         //debug3("class ctr now %d",classCtr);
                                         break;
+
                              }
+
                              for (k = intervals[i].begin; k <= intervals[i].end; k++) {
                                       if (classCtr >= MAXCLASSES)
                                               break;
@@ -867,12 +802,12 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
                                               debug3("generating left-aligned bid for job %d",job_array[job_idx].job_id);
                                               cArray[classCtr].numNodes = k - intervals[i].begin + 1;
                                               cArray[classCtr].numCores = cores;
-                                              cArray[classCtr].numGpus = job_array[job_idx].gpu;
+                                              cArray[classCtr].numGpus = g;
                                               debug4("creating nodesUsed size %d",cArray[classCtr].numNodes);
                                               cArray[classCtr].nodesUsed = (int *)malloc(cArray[classCtr].numNodes * sizeof(int));
                                               cArray[classCtr].preference = preferenceCalculation
-                                                      (cArray[classCtr].numNodes, nodeSize, 1,
-                                                      nodesetCount[0], 0.0, 0.25, 0.0);
+                                                      (cArray[classCtr].numNodes, 1, nodesetCount[0], 
+							0.0, 0.25, 0.0, g, job_array[job_idx].gpu_max);
                                               debug4("filling nodesUsed");
                                               for (m = 0; m < cArray[classCtr].numNodes; m++) {
                                                       debug5("nodesUsed element %d is %d",m,k+m);
@@ -887,7 +822,7 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 	debug3("created %d aligned classes for job %d",classCtr - firstContigClass, job_idx);
         lastAlignedClass = classCtr;
 	i = 0;
-	debug3("trying to create aligned bids for job_idx %d firstContigClass %d lastAlignedClass %d",
+	debug("trying to create aligned bids for job_idx %d firstContigClass %d lastAlignedClass %d",
 	        job_idx, firstContigClass, lastAlignedClass);
 	numClass = lastAlignedClass - firstContigClass;
 	// the job has numClass classes 
@@ -896,23 +831,24 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 	                break;
 		ret = newBid(job_array[job_idx].min_cpus, job_idx, j,
 			job_array[job_idx].priority, cArray[j].preference, 
-			cArray[j].numNodes, cArray[j].nodesUsed, job_array);
+			cArray[j].numNodes, cArray[j].nodesUsed, cArray[j].numGpus);
         	if (ret == -1)
         	        break;
                 else if (ret >= 0)
                         i++;
 	}
 
-	// non-contiguous bids 
+	// non-aligned contiguous bids 
 	// k: non-contiguousness level
 	// depth first search 
 
         for (i = 0; i < intervalCtr; i++) {
-                 if (intervals[i].gpu != job_array[job_idx].gpu)
+		int g = intervals[i].gpu;
+                 if ( (g < job_array[job_idx].gpu) || (g > job_array[job_idx].gpu_max) )
                         continue;
                  if ( (intervals[i].size >= job_array[job_idx].min_cpus) ) {
 			for (l = intervals[i].begin; l <= intervals[i].end; l++) {
-                             for (k = intervals[i].begin; k <= intervals[i].end; k++) {
+                             for (k = l; k < intervals[i].end; k++) {
                                       if (classCtr >= MAXCLASSES)
                                               break;
                                       if (classCtr - firstClass >= MAXCLASSESPERJOB)
@@ -926,12 +862,12 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
                                       }
                                               cArray[classCtr].numNodes = k + 1 - l;
                                               cArray[classCtr].numCores = cores;
-                                              cArray[classCtr].numGpus = job_array[job_idx].gpu;
+                                              cArray[classCtr].numGpus = g;
                                               debug4("creating nodesUsed size %d",cArray[classCtr].numNodes);
                                               cArray[classCtr].nodesUsed = (int *)malloc(cArray[classCtr].numNodes * sizeof(int));
                                               cArray[classCtr].preference = preferenceCalculation
-                                                      (cArray[classCtr].numNodes, nodeSize, 1,
-                                                      nodesetCount[0], 0.25, 0.25, 0.0);
+                                                      (cArray[classCtr].numNodes, 1, nodesetCount[0], 
+							0.25, 0.25, 0.0, g, job_array[job_idx].gpu_max);
                                               debug4("filling nodesUsed");
                                               for (m = 0; m < cArray[classCtr].numNodes; m++) {
                                                       debug5("nodesUsed element %d is %d",m,k+m);
@@ -950,7 +886,7 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 	debug3("created %d classes for job %d",classCtr - lastAlignedClass, job_idx);
         lastContClass = classCtr;
 	i = 0;
-	debug3("trying to create bids for job_idx %d lastAlignedClass %d lastContClass %d",
+	debug("trying to create bids for job_idx %d lastAlignedClass %d lastContClass %d",
 	        job_idx, lastAlignedClass, lastContClass);
 	numClass = lastContClass - lastAlignedClass;
 	// the job has numClass classes
@@ -965,7 +901,8 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 	                for (l = 0; l < k; l++)
 	                        if (contigbids[l] == j)
 	                                continue;
-                        if ((cArray[j].preference >= max_pref) && (cArray[j].sumBids <= max_sum)) {
+			if ((cArray[j].preference >= max_pref) && (cArray[j].sumBids <= max_sum)) {
+//sumbids		if (cArray[j].preference >= max_pref) {
                                 max_pref = cArray[j].preference;
 				max_sum = cArray[j].sumBids;
                                 max_pref_idx = j;
@@ -977,7 +914,7 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 		debug3("class with max pref (%.2f) is %d",max_pref, max_pref_idx);
 		ret = newBid(cArray[max_pref_idx].numCores, job_idx, max_pref_idx,
 			job_array[job_idx].priority, cArray[max_pref_idx].preference, 
-			cArray[max_pref_idx].numNodes, cArray[max_pref_idx].nodesUsed, job_array);
+			cArray[max_pref_idx].numNodes, cArray[max_pref_idx].nodesUsed, cArray[max_pref_idx].numGpus);
                 if (ret >= 0) {
                         i++;
                         contigbids[k++] = max_pref_idx;
@@ -991,14 +928,19 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 	// k: non-contiguousness level 
 	// depth first search 
 
+	debug("creating non-contig core bids");
 	if (job_array[job_idx].contiguous != 1) {
 	for (i = 0; i < intervalCtr; i++) {
-	        if (intervals[i].gpu != job_array[job_idx].gpu)
+		int g = intervals[i].gpu;
+		debug3("interval %d gpu %d , job gpu %d-%d",i,intervals[i].gpu,job_array[job_idx].gpu,job_array[job_idx].gpu_max);
+		debug3("sth4");
+	        if ( (g < job_array[job_idx].gpu) || (g > job_array[job_idx].gpu_max) )
 	                continue;
 		temp.size = intervals[i].size;
 		temp.numnodes = intervals[i].numnodes;
 		temp.begin = intervals[i].begin;
 		temp.end = intervals[i].end;
+                debug3("mixed interval size %d numnodes %d",temp.size,temp.numnodes);
 		for (p = 0; p < temp.numnodes; p++)
                         nodes[p] = intervals[i].begin + p;
 		int contig = 1;
@@ -1012,52 +954,55 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 				break;
 			}
 
-			if (intervals[j].gpu != job_array[job_idx].gpu)
-                                continue;
-			        contig++;
-			        if (contig >= NONCONTIGLEVEL) {
-			                debug3("max noncontig level (%d) reached",NONCONTIGLEVEL);
-			                break;
-			        }
-				temp.size += intervals[j].size;
+			int gj = intervals[j].gpu;
+			if (gj != g)
+				continue;
+		        contig++;
+		        if (contig >= NONCONTIGLEVEL) {
+		                debug3("max noncontig level (%d) reached",NONCONTIGLEVEL);
+		                break;
+		        }
+			temp.size += intervals[j].size;
 
-				for (p = 0; p < intervals[j].numnodes; p++) {
-				        //debug3("intervals[%d].nodes(%d) is: %d",j,p,intervals[j].nodes[p]);
-                                        nodes[p + temp.numnodes] = intervals[j].begin + p;
-                                        //intervals[j].nodes[p];
-				        //debug3("nodes element %d is %d",p + temp.numnodes,nodes[p + temp.numnodes]);	
-				        //debug3("interval %d nodes %d: %d",j,p,intervals[j].nodes[p]);
+			for (p = 0; p < intervals[j].numnodes; p++) {
+			        //debug3("intervals[%d].nodes(%d) is: %d",j,p,intervals[j].nodes[p]);
+				nodes[p + temp.numnodes] = intervals[j].begin + p;
+                                //intervals[j].nodes[p];
+				//debug3("nodes element %d is %d",p + temp.numnodes,nodes[p + temp.numnodes]);	
+				//debug3("interval %d nodes %d: %d",j,p,intervals[j].nodes[p]);
+                        }
+			
+			temp.numnodes += intervals[j].numnodes;
+			//xfor (p = 0; p < temp.numnodes; p++)
+			        //xnodes[p] = 1;
+
+        	        debug3("mixed interval size %d job size %d",temp.size,job_array[job_idx].min_cpus);
+		        if ( (temp.size >= job_array[job_idx].min_cpus) ) {
+		 	for (k = 1; k <= temp.numnodes; k++) {
+		        	if (classCtr >= MAXCLASSES) {
+		                	debug3("max number of classes (%d) reached",MAXCLASSES);
+		                      	break;
                                 }
-				temp.numnodes += intervals[j].numnodes;
-				//xfor (p = 0; p < temp.numnodes; p++)
-				        //xnodes[p] = 1;
-
-		                if ( (temp.size >= job_array[job_idx].min_cpus) ) {
-		                      	for (k = 0; k < temp.numnodes; k++) {
-		                      	        if (classCtr >= MAXCLASSES) {
-		                      	                debug3("max number of classes (%d) reached",MAXCLASSES);
-		                      	                break;
-                                                }
-					       	if (classCtr - firstClass >= MAXCLASSESPERJOB) {
+				if (classCtr - firstClass >= MAXCLASSESPERJOB) {
   				                        debug3("max number of classes per job (%d) reached for job %d",MAXCLASSESPERJOB,job_array[job_idx].job_id);
                         				break;
 						}
 						cores = 0;	
 						for (p = 0; p < k; p++) {
-						        //debug("nodes[p:%d]: %d",p,nodes[p]);
+					        	//debug("nodes[p:%d]: %d",p,nodes[p]);
 							cores += node_array[nodes[p]].rem_cpus;
 						}
-						//debug("int i: %d, j: %d, %d segments, %d cores", i, j, contig, cores);
+						debug("int i: %d, j: %d, %d segments, %d cores", i, j, contig, cores);
 		                                if (cores < job_array[job_idx].min_cpus)
 							continue;
 
                 		                	cArray[classCtr].numNodes = k;
                                 			cArray[classCtr].numCores = cores;
-		                                        cArray[classCtr].numGpus = job_array[job_idx].gpu;
+		                                        cArray[classCtr].numGpus = g;
                 		                        cArray[classCtr].nodesUsed = (int *)malloc(cArray[classCtr].numNodes * sizeof(int));
                                                         cArray[classCtr].preference = preferenceCalculation
-                                                                (cArray[classCtr].numNodes, nodeSize, contig,
-                                                                nodesetCount[0], 0.5, 0.25, 0.25);		                                        
+                                                                (cArray[classCtr].numNodes, contig, nodesetCount[0], 
+								0.5, 0.25, 0.25, g, job_array[job_idx].gpu_max);
                                                         for (m = 0; m < cArray[classCtr].numNodes; m++)
                 		                        	cArray[classCtr].nodesUsed[m] = nodes[m];
                                 		       	classCtr++;
@@ -1076,7 +1021,7 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
 	numClass = lastClass - lastContClass;
 	
 	i = 0;
-        debug3("searched suitable intervals, lastContClass: %d, lastClass: %d", lastContClass, lastClass);
+        debug("searched suitable intervals, lastContClass: %d, lastClass: %d", lastContClass, lastClass);
 	k = 0;
         int *noncontigbids = (int *) malloc((MAXBIDPERJOB - i) * sizeof(int));
 	while ((i < MAXBIDPERJOB) && (i < numClass)) {
@@ -1087,9 +1032,10 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
                         for (l = 0; l < k; l++)
                                 if (noncontigbids[l] == j)
                                         continue;
-                        if ((cArray[j].preference >= max_pref) && (cArray[j].sumBids <= max_sum)) {
+			if ((cArray[j].preference >= max_pref) && (cArray[j].sumBids <= max_sum)) {
+//sumbids		if (cArray[j].preference >= max_pref) {
                                 max_pref = cArray[j].preference;
-                                max_sum = cArray[j].sumBids;
+				max_sum = cArray[j].sumBids;
                                 max_pref_idx = j;
                         }
                 }
@@ -1100,10 +1046,10 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
                 if (max_pref_idx == -1) {
                         break;
                 }
-		debug3("class with maximum preference (%.2f) is %d", max_pref, max_pref_idx);
+		debug("class with maximum preference (%.2f) is %d", max_pref, max_pref_idx);
 		ret = newBid(cArray[max_pref_idx].numCores, job_idx, max_pref_idx,
 			job_array[job_idx].priority, cArray[max_pref_idx].preference, 
-			cArray[max_pref_idx].numNodes, cArray[max_pref_idx].nodesUsed, job_array);
+			cArray[max_pref_idx].numNodes, cArray[max_pref_idx].nodesUsed, cArray[max_pref_idx].numGpus);
                 if (ret >= 0)
                         i++;
                 else if (ret == -1)
@@ -1121,13 +1067,11 @@ void classGenerationC(solver_job_list_t *job_array, int job_idx, int nodeSize, s
                         
 
 inline int
-populatebynonzero (CPXENVptr env, CPXLPptr lp, int m, int n,
-		sched_nodeinfo_t *node_array, solver_job_list_t* job_array)
+populatebynonzero (CPXENVptr env, CPXLPptr lp, int m, int n)
 {
-        //jobNodeCtr--;
-	int NUMCOLS = bidCtr + 2 * jobNodeCtr; 
-	int NUMROWS = 2 * n + bidCtr + 2 * m + 1 * jobNodeCtr + n * m;
-	int NUMNZ = 3 * bidCtr + 11 * (jobNodeCtr);
+	int NUMCOLS = bidCtr; 
+	int NUMROWS = n + 2 * m;
+	int NUMNZ = bidCtr + 2 * (jobNodeCtr);
 	int NZc = 0; /* nonzero counter */
 	
 	int status = 0;
@@ -1146,7 +1090,7 @@ populatebynonzero (CPXENVptr env, CPXLPptr lp, int m, int n,
 	int *collist = (int*)malloc(NUMNZ * sizeof(int));
 	double *vallist = (double*)malloc(NUMNZ * sizeof(double));
 	int i, j, k, c, tempCtr;
-	
+
 	CPXchgobjsen (env, lp, CPX_MAX);  /* Problem is maximization */
 	
 	debug3("bidCtr %d jobNodeCtr %d NUMROWS %d NUMCOLS %d", bidCtr, jobNodeCtr,NUMROWS,NUMCOLS);
@@ -1154,42 +1098,28 @@ populatebynonzero (CPXENVptr env, CPXLPptr lp, int m, int n,
 
 	/* row definitions */
 	
-	/* constraints (1) b_jc <= 1 */
+	/* constraints (2) b_jc <= 1 */
 	for (j = 0; j < n; j++) {
 		sense[j] = 'L';
 		rhs[j] = 1.0;
 	}
 	
-	/* constraints (2) and (3); = 0 */
-	for (j = n; j < n * 2 + bidCtr; j++) {
-		sense[j] = 'E';
-		rhs[j] = 0.0;
-	}
-	
-	/* constraints (4) and (5) */
-	for (j = n * 2 + bidCtr; j < n * 2 + bidCtr + m; j++) {
-	        i = j - (n * 2 + bidCtr);
+	/* constraints (3) and (4) */
+	for (j = n; j < n + m; j++) {
+	        i = j - n;
 		sense[j] = 'L';
 		rhs[j] = 1.0 * node_array[i].rem_cpus;
 		sense[m + j] = 'L';
 		rhs[m + j] = 1.0 * node_array[i].rem_gpus;
 	}
 	
-	/* constraint (6)  */
-	for (j = n * 2 + bidCtr + 2 * m ; j < n * 2 + bidCtr + 2 * m + jobNodeCtr; j++) {
-		sense[j] = 'L';
-		rhs[j] = 0;
-	}
-	
-	/* constraint (8) */
-	c = 2 * n + bidCtr + 2 * m + jobNodeCtr;
-	for (j = c; j < c + m * n; j++) {
-	        sense[j] = 'E';
-	        rhs[j] = 0;
-	}
 	
 	status = CPXnewrows (env, lp, NUMROWS, rhs, sense, NULL, NULL);
-	if ( status ) goto TERMINATE;
+	if ( status ) 
+	{
+		debug3("cpxnewrows failed.");	
+		goto TERMINATE;
+	}
 
 	/* column definitions */	
 
@@ -1205,31 +1135,10 @@ populatebynonzero (CPXENVptr env, CPXLPptr lp, int m, int n,
 		
 	}
 	
-	/* u_jn definitions */
-	for (j = 0; j < jobNodeCtr; j++) {
-		/*
-		sprintf(str, "u_%d",j);
-		colname[bidCtr + j] = str;
-		*/
-		ctype[bidCtr + j] = CPX_BINARY;
-		lb[bidCtr + j] = 0.0;
-		ub[bidCtr + j] = 1.0;
-	}	
-		
-	/* r_jn definitions */
-	for (j = 0; j < jobNodeCtr; j++) {
-		/*
-		sprintf(str, "r_%d",j);
-		colname[bidCtr + jobNodeCtr + j] = str;
-		*/
-		ctype[bidCtr + jobNodeCtr + j] = CPX_INTEGER;
-		lb[bidCtr + jobNodeCtr + j] = 0.0;
-		ub[bidCtr + jobNodeCtr + j] = CPX_INFBOUND;
-	}
-		
 	for (k = 0; k < bidCtr; k++) {
-		debug3("bid %d prio %f preference %f",k,bids[k].priority,bids[k].preference);
-		obj[k] = (bids[k].priority + bids[k].preference * alpha);
+		debug3("bid %d prio %d preference %f, alpha %.2f",k,bids[k].priority,bids[k].preference, alpha);
+		obj[k] = (bids[k].priority + bids[k].preference * alpha) * bids[k].amount;
+//		obj[k] = (bids[k].priority + bids[k].preference * alpha);
 	}
 	
 	for (k = bidCtr; k < NUMCOLS; k++) {
@@ -1237,242 +1146,67 @@ populatebynonzero (CPXENVptr env, CPXLPptr lp, int m, int n,
 	}
 	
 	status = CPXnewcols (env, lp, NUMCOLS, obj, lb, ub, ctype, NULL);
-	if ( status )  goto TERMINATE;
+	if ( status ) {
+                debug3("cpxnewcols failed.");
+		goto TERMINATE;
+	}
 
 	/* constraints */
 	
-	/* constraint (1) coefficients: 
+	/* constraint (2) coefficients: 
 	   sum_bjc <= 1, c in B_j, for all j */
 	for (j = 0; j < n; j++) {
 	        debug("job %d firstbid %d lastbid %d",j,job_array[j].firstBid,job_array[j].lastBid);
 		for (k = job_array[j].firstBid; k < job_array[j].lastBid; k++) {
 			rowlist[NZc] = j;
-			debug("row %d, col %d, NZc %d",j,k,NZc);
+//			debug("row %d, col %d, NZc %d",j,k,NZc);
 			collist[NZc] = k;
-                        debug3("col index of %d is %d",NZc, collist[NZc]);
+//                      debug3("col index of %d is %d",NZc, collist[NZc]);
 			vallist[NZc++] = 1.0;
 		}
 	}
 	/* NZc = bidCtr */
 	debug3("NZc is now %d, should be %d",NZc, bidCtr);
 
-	debug("constraint2 start");
-	/* constraint (2) coefficients: sum_ujn = b_jc * R_J^node */
-	/* bundan emin ol, yanlis gibi sanki */
-	tempCtr = n;
-	for (j = 0; j < n; j++) {
-                //debug("job %d first bid %d last bid %d", j, job_array[j].firstBid, job_array[j].lastBid);
-		for (k = job_array[j].firstBid; k < job_array[j].lastBid; k++) {
-			for (i = bids[k].firstNode; i < bids[k].lastNode; i++) {
-					rowlist[NZc] = tempCtr;
-					collist[NZc] = bidCtr + jobNodeIdx[i];
-                                        debug3("col index of %d is %d",NZc, collist[NZc]);
-					//if (job_array[j].min_nodes == 0)
-                                        	//vallist[NZc++] = 0.0;
-					//if (job_array[j].min_nodes > 0)
-                                        	vallist[NZc++] = 1.0;
-					//debug("sum_ujn row %d, col %d coef 1.0 (nodeName %d)",tempCtr, bidCtr + jobNodeIdx[i], jobNodeName[i]);
-			}			
-			rowlist[NZc] = tempCtr++;
-			collist[NZc] = k;
-                        debug3("col index of %d is %d",NZc, collist[NZc]);
-			if (job_array[j].min_nodes > 0)
-                        	vallist[NZc++] = (-1.0 * bids[k].numNodes);
-			if (job_array[j].min_nodes == 0)
-                        	vallist[NZc++] = (-1.0 * bids[k].numNodes);
-			//debug("sum_ujn row %d col %d coef %d",tempCtr - 1, k, -job_array[j].nodes);
-		}
-	}
-	/* NZc = bidCtr + bidCtr + jobNodeCtr */
-	debug3("NZc is now %d, should be %d",NZc, bidCtr * 2 + jobNodeCtr);
-
-	debug("constraint 3 start");
-	/* constraint (3) coefficients: sum_ujn + r_jn = R_J^cpu * b_jc */
-	tempCtr = n + bidCtr;
-	for (j = 0; j < n; j++) {
-		for (k = job_array[j].firstBid; k < job_array[j].lastBid; k++) {
-			/* sum _bjc */
-			rowlist[NZc] = tempCtr;
-			collist[NZc] = k;
-			vallist[NZc++] = -bids[k].amount;
-			//debug("sum_bjc row %d col %d coef %d", tempCtr, k, -job_array[j].min_cpus);
-		
-			for (i = bids[k].firstNode; i < bids[k].lastNode; i++) {
-				/* sum u_jn */
-				rowlist[NZc] = tempCtr;
-				collist[NZc] = bidCtr + jobNodeIdx[i];
-                       	        debug3("col index of %d is %d",NZc, collist[NZc]);
-				vallist[NZc++] = 1.0;
-				//debug("sum_ujn row %d col %d val 1", tempCtr, bidCtr + jobNodeIdx[i]);
-			
-				/* sum r_jn */
-				rowlist[NZc] = tempCtr;
-				collist[NZc] = bidCtr + jobNodeCtr + jobNodeIdx[i];
-                       	        debug3("col index of %d is %d",NZc, collist[NZc]);
-				vallist[NZc++] = 1.0;
-				//debug("sum_rjn row %d col %d val 1", tempCtr, bidCtr + jobNodeCtr + jobNodeIdx[i]);
-			}
-		}
-		tempCtr++;
-	}
-	/* NZc = 2 * bidCtr + jobNodeCtr + 2 * jobNodeCtr + bidCtr */
-	debug3("NZc is now %d, should be %d",NZc, 3 * bidCtr + 3 * jobNodeCtr);
-	
-        debug("constraint 4 start");
-	/* constraint (4) coefficients: u_jn + r_jn <= A_n^cpu */
+        debug("constraint 3 start");
+	/* constraint (3) coefficients: b_jc * T_cn <= A_n^cpu */
 	tempCtr = 2 * n + bidCtr;
 	for (j = 0; j < n; j++) {
 		for (k = job_array[j].firstBid; k < job_array[j].lastBid; k++) {
 			for (c = bids[k].firstNode; c < bids[k].lastNode; c++) {
-				rowlist[NZc] = tempCtr + jobNodeName[c];
-				collist[NZc] = bidCtr + jobNodeIdx[c];
-                       	        debug3("col index of %d is %d",NZc, collist[NZc]);
-                                vallist[NZc++] = 1.0;
-				//debug("cpu sum row %d col %d val 1",n + 2 * bidCtr + i, bidCtr + jobNodeIdx[c]);
-				
-				rowlist[NZc] = tempCtr + jobNodeName[c];
-				collist[NZc] = bidCtr + jobNodeCtr + jobNodeIdx[c];
-                       	        debug3("col index of %d is %d",NZc, collist[NZc]);
-				vallist[NZc++] = 1.0;
-				//debug("cpu sum row %d col %d val 1",n + 2 * bidCtr + i, bidCtr + jobNodeCtr + jobNodeIdx[c]);
+				rowlist[NZc] = n + jobNodeName[c];
+				collist[NZc] = k;
+                                vallist[NZc++] = T[c];
+//				debug3("row %d col %d jobnodename %d", rowlist[NZc-1], collist[NZc-1], jobNodeName[c]);
                         }
                 }
         }
-	/* NZc = 3 * bidCtr + 3 * jobNodeCtr + 2 * jobNodeCtr */
-	debug3("NZc is now %d, should be %d",NZc, 3 * bidCtr + 5 * jobNodeCtr);
 
-        debug("constraint5 start");
-	/* constraint (5) coefficients: u_jn * g_j <= A_n^gpu */
-	for (j = 0; j < n; j++) {
-		for (k = job_array[j].firstBid; k < job_array[j].lastBid; k++) {
-                        for (c = bids[k].firstNode; c < bids[k].lastNode; c++) {
-				rowlist[NZc] = n *2 + bidCtr + m + jobNodeName[c];
-				collist[NZc] = bidCtr + jobNodeIdx[c];
-                       	        debug3("col index of %d is %d",NZc, collist[NZc]);
-				vallist[NZc++] = 1.0 * job_array[j].gpu;
-				//debug("cpu sum row %d col %d val %d",n + 2 * bidCtr + m + i, bidCtr + jobNodeIdx[c], job_array[j].gpu);
-			}
-                }
-        }
-	/* NZc = 3 * bidCtr + 6 * jobNodeCtr */
-	debug3("NZc is now %d, should be %d",NZc, 3 * bidCtr + 6 * jobNodeCtr);
-	
-        debug("constraint6 start");
-	/* constraint (6); 
-	r_jn - u_jn * MIN(A_n^cpu - 1 , R_j^cpu - 1) <= 0
-	*/
-        tempCtr = n * 2 + bidCtr + m * 2;
+        debug("constraint 4 start");
+        /* constraint (4) coefficients: U%%X
+        U_cn * R_j^gpu <= A_n^gpu */
+        tempCtr = 2 * n + bidCtr;
         for (j = 0; j < n; j++) {
                 for (k = job_array[j].firstBid; k < job_array[j].lastBid; k++) {
-			for (c = bids[k].firstNode; c < bids[k].lastNode; c++) {
-				rowlist[NZc] = tempCtr;
-				collist[NZc] = bidCtr + jobNodeCtr + jobNodeIdx[c];
-                       	        debug3("col index of %d is %d",NZc, collist[NZc]);
-				vallist[NZc++] = 1.0;
-				//debug("rjn<=ujn row %d col %d val 1",tempCtr, bidCtr + jobNodeCtr + jobNodeIdx[c]);
-				
-				rowlist[NZc] = tempCtr++;
-				collist[NZc] = bidCtr + jobNodeIdx[c];
-				i = jobNodeName[c];
-                       	        debug3("col index of %d is %d",NZc, collist[NZc]);
-				vallist[NZc++] = -1.0 * MIN(bids[k].amount - 1, node_array[i].rem_cpus - 1);
-				//debug("rjn<=ujn sum row %d col %d val %.2f", tempCtr, bidCtr + jobNodeIdx[c],-1.0 * MIN(job_array[j].min_cpus - 1, node_array[i].rem_cpus - 1));
-                        }
-		}
-	}
-	/* NZc = 3 * bidCtr + 8 * jobNodeCtr */
-	debug3("NZc is now %d, should be %d",NZc, 3 * bidCtr + 8 * jobNodeCtr);
-	
-        debug("constraint8 start");
-	/* constraint (8);
-        IF CPUS_PER_NODE IS SET: 
-        u_jn + r_jn = \sum for all c \in B_j cpus_per_node * b_jc 
-        */
-        /*
-	tempCtr = 2 * n + bidCtr + 2 * m + jobNodeCtr;
-	for (j = 0; j < n; j++) {
-		for (k = job_array[j].firstBid; k < job_array[j].lastBid; k++) {
-			for (i = bids[k].firstNode; i < bids[k].lastNode; i++) {
-        */
-				/* u_jn */
-				/*
-				rowlist[NZc] = tempCtr;
-				collist[NZc] = bidCtr + jobNodeIdx[i];
-				if (job_array[j].cpus_per_node > 0)
-        				vallist[NZc++] = 1.0;
-                                else
-                                        vallist[NZc++] = 0.0;
-                                */
-				/* r_jn */
-				/*
-				rowlist[NZc] = tempCtr;
-				collist[NZc] = bidCtr + jobNodeCtr + jobNodeIdx[i];
-				if (job_array[j].cpus_per_node > 0)
-        				vallist[NZc++] = 1.0;
-                                else
-                                        vallist[NZc++] = 0.0;
-                                
-        			rowlist[NZc] = tempCtr;
-        			collist[NZc] = k;
-        			vallist[NZc++] = -1.0 * (double)(job_array[j].cpus_per_node);
-        			
-        		}
-                        tempCtr++;
-		}
-	}
-	*/
-	
-	tempCtr = 2 * n + bidCtr + 2 * m + jobNodeCtr;
-	for (j = 0; j < n; j++) {
-	        for (k = job_array[j].firstBid; k < job_array[j].lastBid; k++) {
-	                for (i = bids[k].firstNode; i < bids[k].lastNode; i++) {
-        	                /* u_jn */
-        	                rowlist[NZc] = tempCtr + j * m + jobNodeName[i];
-        	                debug3("r_jn u_jn in row %d, j %d i %d",tempCtr + j * m + i, j, i);
-        	                collist[NZc] = bidCtr + jobNodeIdx[i];
-                       	        debug3("col index of %d is %d",NZc, collist[NZc]);
-        			if (job_array[j].cpus_per_node > 0)
-               				vallist[NZc++] = 1.0;
-                                else
-                                        vallist[NZc++] = 0.0;
-                                        
-                                /* r_jn */
-                                rowlist[NZc] = tempCtr + j * m + jobNodeName[i];
-        			collist[NZc] = bidCtr + jobNodeCtr + jobNodeIdx[i];
-                       	        debug3("col index of %d is %d",NZc, collist[NZc]);
-        			if (job_array[j].cpus_per_node > 0)
-                			vallist[NZc++] = 1.0;
-                                else
-                                        vallist[NZc++] = 0.0;
-                        }
-	        }
-	}
-	/* NZc = 3 * bidCtr + 8 * jobNodeCtr + m * n * 2 */
-	debug3("NZc is now %d, should be %d",NZc, 3 * bidCtr + 10 * jobNodeCtr);
-	debug3("constraint 8, u_jn r_jn done. NZc is %d",NZc);
-	
-	for (j = 0; j < n; j++) {
-	        for (k = job_array[j].firstBid; k < job_array[j].lastBid; k++) {
-	                for (i = bids[k].firstNode; i < bids[k].lastNode; i++) {
-	                        /* b_jc */
-	                        rowlist[NZc] = tempCtr + j * m + jobNodeName[i];
-	                        debug3("j %d k %d i %d temp %d in row %d",
-	                                j, k, i, tempCtr, rowlist[NZc]);
-	                        collist[NZc] = k;
-                       	        debug3("col index of %d is %d",NZc, collist[NZc]);
-	                        vallist[NZc++] = -1.0 * (double)(job_array[j].cpus_per_node);
+                        for (c = bids[k].firstNode; c < bids[k].lastNode; c++) {
+                                rowlist[NZc] = n + m + jobNodeName[c];
+                                collist[NZc] = k;
+                                vallist[NZc++] = bids[k].gpu;
+//                              debug3("row %d col %d jobnodename %d", rowlist[NZc-1], collist[NZc-1], jobNodeName[c]);
                         }
                 }
-	}
+        }
 	/* NZc = 3 * bidCtr + 9 * jobNodeCtr + m * n * 2 */	
-	debug3("NZc is now %d, should be %d",NZc, 3 * bidCtr + 11 * jobNodeCtr);
+	debug3("NZc is now %d, should be %d",NZc, bidCtr + 2 * jobNodeCtr);
 	
-	debug3("constraint 8, b_jc done. NZc is %d",NZc);
 	/*nzc = num_bids*/
 	
 	status = CPXchgcoeflist (env, lp, NZc, rowlist, collist, vallist);   
 	debug3("status from change coef list: %d",status);
-	if ( status )  goto TERMINATE;
+	if ( status ) {
+                debug3("cpxchgcoeflist failed.");
+		goto TERMINATE;
+	}
 
 TERMINATE:
 	free_and_null ((char **) &obj);
@@ -1495,14 +1229,14 @@ TERMINATE:
 returns 0 if solution found
 	2 if time limit hit
 */
-extern int solve_allocation(int nodeSize, int windowSize, int timeout, 
-			sched_nodeinfo_t *node_array, 
-			solver_job_list_t *job_array, int max_bid_count)
+extern int solve_allocation(int m, int n, int timeout,
+			sched_nodeinfo_t* _node_array, solver_job_list_t* _job_array,
+			int max_bid_count)
 {
 	char filename[256];
 	solver_job_list_t *sjob_ptr;
 	struct job_details *job_det_ptr;
-	int n = windowSize, m = nodeSize, k, c, i;
+	int k, c, i;
 	bool half = false;
 	uint32_t begin_time = time(NULL), mid_time;
 	uint32_t time1;
@@ -1518,39 +1252,44 @@ extern int solve_allocation(int nodeSize, int windowSize, int timeout,
 	int status = 0, status2 = 0, j, cur_numrows, cur_numcols;
 	FILE *log;
 	
+	/* set initial values */
+        node_array = _node_array;
+        job_array = _job_array;
+        nodeSize = m;
+        windowSize = n;
+
+	debug3("window size %d", windowSize);
+	for (i = 0; i < windowSize; i++) {
+		debug3("job id %d",_job_array[i].job_id);
+	}
+
 	bidCtr = 0;
 	classMapCtr = 0;
 	classCtr = 0;
 	jobNodeCtr = 0;
 	maxBids = max_bid_count;
-	
-	jobNodeIdx = (int *)malloc(MAXJOBNODE * 10 * sizeof(int));
-	jobNodeName = (int *)malloc(MAXJOBNODE * 10 * sizeof(int));
+
+	jobNodeIdx = (int *)malloc(MAXJOBNODE * sizeof(int));
+	jobNodeName = (int *)malloc(MAXJOBNODE * sizeof(int));
+	T = (int *)malloc(MAXJOBNODE * sizeof(int));
 	// number of class types cannot exceed window size
 	//classMap = (class_map *)malloc(windowSize * sizeof(class_map));
 	intervals = (interval *)malloc(MAXINTERVALS * sizeof(interval));
 	nArray = (int *)malloc(nodeSize * sizeof(int));
 	for (i = 0; i < nodeSize; i++)
 	        nArray[i] = 0;
-	
+
 	/* find minPrioDiff */
-	double minPrio = 10000000.0;
+	uint32_t minPrio = 0;
 	for (i = 0; i < windowSize; i++) {
                 if (job_array[i].priority < minPrio) {
                         minPrio = job_array[i].priority;
                 }
 	}
 	        
-	
-	/* call class generation */
-	/*
-	classListCreation(nodeSize, node_array);
-	classGeneration(nodeSize, node_array);
-	*/
-	
 	/* cumsum generation */
 	time1 = time(NULL);
-	cumSumGeneration(nodeSize, node_array);
+	cumSumGeneration();
 	debug2("timer: cumsum took %u",(uint16_t)(time(NULL)-time1));
 	
 	/* call bid generation 
@@ -1560,7 +1299,7 @@ extern int solve_allocation(int nodeSize, int windowSize, int timeout,
 	cArray = (class *)malloc(MAXCLASSES * sizeof(class));
 	time1 = time(NULL);
 
-	//slurmBids(job_array, nodeSize, windowSize, node_array);
+	//slurmBids();
         //slurmBids icin
         temp_node_array = (sched_nodeinfo_t*)
                 malloc(node_record_count * sizeof(sched_nodeinfo_t));
@@ -1579,10 +1318,17 @@ extern int solve_allocation(int nodeSize, int windowSize, int timeout,
  		        job_array[j].firstBid = bidCtr;
  		        job_array[j].lastBid = bidCtr;
                 } else if (job_array[j].min_nodes > 0) {
- 		        classGenerationN(job_array, j, nodeSize, node_array);
+ 		        classGenerationN(j);
  		} else {
-                        classGenerationC(job_array, j, nodeSize, node_array);
+                        classGenerationC(j);
                 }
+	}
+
+	for (j = 0; j < windowSize; j++) {
+		solver_job_list_t* jobptr = &job_array[j];
+		info("scheduling: job %d, id %d firstBid: %d, lastBid: %d, total %d",
+			j, jobptr->job_id, jobptr->firstBid, jobptr->lastBid,
+			jobptr->lastBid - jobptr->firstBid);
 	}
 
         for (j = 0; j < windowSize; j++)
@@ -1594,7 +1340,7 @@ extern int solve_allocation(int nodeSize, int windowSize, int timeout,
 	}
 	
         alpha = minPrio / (bidCtr + 1);
-        debug2("minPrio is %.2f, bidCtr is %d, alpha is %.2f",minPrio,bidCtr,alpha);
+        debug2("minPrio is %d, bidCtr is %d, alpha is %.2f",minPrio,bidCtr,alpha);
         
 	debug2("timer: bid generation took %u",(uint16_t)(time(NULL)-time1));
 	/* buradan oncesine yaziyorum herseyi */
@@ -1623,13 +1369,18 @@ extern int solve_allocation(int nodeSize, int windowSize, int timeout,
 	}
 
 	time1 = time(NULL);
-	status = populatebynonzero (env, lp, m, n, node_array, job_array);
-	debug2("timer: populating lp took %u",(uint16_t)(time(NULL)-time1));
+	status = populatebynonzero (env, lp, m, n);
+
+	uint16_t timerBidGen = (uint16_t)(time(NULL)-time1);
+	debug2("timer: populating lp took %u",timerBidGen);
+
 	debug2("returned from populate %d", status);
-	sprintf(filename,"/root/logs/instance.lp");
-	debug2("lp file: %s",filename);
-	CPXwriteprob (env, lp, filename, NULL);
-	debug2("timer: writing lp took %u",(uint16_t)(time(NULL)-time1));
+
+	//sprintf(filename,"/home/seren/AUCSCHED2/logs/instance.lp");
+	//debug2("lp file: %s",filename);
+	time1 = time(NULL);
+	//CPXwriteprob (env, lp, filename, NULL);
+	//debug2("timer: writing lp took %u",(uint16_t)(time(NULL)-time1));
 
 	if ( status ) {
 		fatal("Failed to populate problem.");
@@ -1644,36 +1395,67 @@ extern int solve_allocation(int nodeSize, int windowSize, int timeout,
 	}
 
 	status = CPXsetintparam(env, CPX_PARAM_THREADS, 12);
-	debug2("threads set to %d", 6);
+	debug2("threads set to %d", 12);
 	if ( status ) {
 		fatal("thread setting problem.");
 	}
 
 	time1 = time(NULL);
-	debug("optimizing");
+
+	if (bidCtr == 0) {
+		info("scheduling at %u no bids created.", time1);
+		goto TERMINATE;
+	}
+
+	info("scheduling at %u with %d jobs, %d bids",
+	        time1, windowSize, bidCtr); 
 	status = CPXmipopt (env, lp);
-	debug2("timer: solving ip took %u",(uint16_t)(time(NULL)-time1));
+
+	uint16_t timerSolution = (uint16_t)(time(NULL)-time1);
+	info("scheduling: solving ip took %u", timerSolution);
+	info("STATS: %d jobs, %d bids, %d bidgentime, %d solutiontime",
+	        windowSize, bidCtr, timerBidGen, timerSolution);
+
+	info("scheduling, status: %d - after mipopt", status);
 
 	if (status == CPXERR_NO_SOLN) {
-	        debug("No solution exists. Probably window size error. Reducing window size, status: %d", status);
+	        info("scheduling: no solution exists. Probably window size error. Reducing window size, status: %d", status);
 	        half = true;
 	}
-	
-	if ((status == CPXMIP_TIME_LIM_INFEAS) || 
-		((status == CPXMIP_TIME_LIM_FEAS) && (objval < 0.1)) ) {
-		debug("Time limit hit, reducing window size by half, status: %d.",status);
-		half = true;
-	} 
-	
 
-	if ( status ) {
-		debug("Failed to optimize LP. status: %d",status);
+	status = CPXgetstat (env, lp);
+	info("scheduling, status: %d - after getstat", status);
+	
+	if ( !status ) {
+		info("scheduling: error in status: %d.",status);
+		half = true;
 		goto TERMINATE;
 	}
 	
-	status = CPXgetobjval (env, lp, &objval); 
+	status2 = CPXgetobjval (env, lp, &objval); 
+	if ((status == CPXMIP_TIME_LIM_INFEAS) || 
+		((status == CPXMIP_TIME_LIM_FEAS) && (objval < 0.1)) ) {
+		info("scheduling: time limit hit, reducing window size by half, status: %d.",status);
+	        //sprintf(filename,"/home/seren/AUCSCHED2/logs/error.%d.lp",time1);
+	        //debug2("lp file: %s",filename);
+	        //CPXwriteprob (env, lp, filename, NULL);	
+		half = true;
+		goto TERMINATE;
+	} 
+	
+/*
 	if ( status ) {
-		debug("Error in objective value: %d.",status);
+		info("scheduling: failed to optimize LP. status: %d",status);
+		goto TERMINATE;
+	}
+*/	
+	info("scheduling, status: %d - after getobjval", status2);
+	if ( status2 ) {
+		info("scheduling: error in objective value: %d.",status2);
+//		fatal("dying, see instance.lp");
+	        //sprintf(filename,"/home/seren/AUCSCHED2/logs/error.%d.lp",time1);
+	        //debug2("lp file: %s",filename);
+	        //CPXwriteprob (env, lp, filename, NULL);	
 		half = true;
 		goto TERMINATE;
 	}
@@ -1681,11 +1463,14 @@ extern int solve_allocation(int nodeSize, int windowSize, int timeout,
 	debug2("objective value: %.2f",objval);
 	if ( (objval < 0.01) && ((int)(time(NULL)-time1) >= timeout) ) {
 	        debug("Objective value 0 and time limit hit. Reducing window size.");
-	        return 2;
+		half = true;
+	        //sprintf(filename,"/home/seren/AUCSCHED2/logs/error.%d.lp",time1);
+	        //debug2("lp file: %s",filename);
+	        //CPXwriteprob (env, lp, filename, NULL);	
+//	        return 2;
+		goto TERMINATE;
 	}
 
-	status = CPXgetstat (env, lp);
-	
 	cur_numrows = CPXgetnumrows (env, lp);
 	cur_numcols = CPXgetnumcols (env, lp);
 	debug2("numrows: %d, numcols: %d",cur_numrows,cur_numcols);
@@ -1704,14 +1489,14 @@ extern int solve_allocation(int nodeSize, int windowSize, int timeout,
 		goto TERMINATE;
 	}
 	
-	log = fopen("/root/logs/log","a+");
+	log = fopen("/home/seren/AUCSCHED2/logs/log","a+");
 	fprintf(log,"size %d, begin %d, mid: %d, end %d, diff1 %d diff2 %d numBids %d filename %s\n",
 		n, (int)begin_time, (int)mid_time, 
 		(int)time(NULL), (int)(time(NULL)-begin_time),
 		(int)(time(NULL) - mid_time), bidCtr, filename);
 	fclose(log);
 	
-        sprintf(filename,"/root/logs/out.%d",mid_time);
+        sprintf(filename,"/home/seren/AUCSCHED2/logs/out.%d",mid_time);
 	log = fopen(filename,"w");
         for (k = 0; k < cur_numcols; k++) {
                 fprintf(log,"x%d: %.2f\n",k,x[k]);
@@ -1726,6 +1511,15 @@ extern int solve_allocation(int nodeSize, int windowSize, int timeout,
 			dummy = 0;
 			sjob_ptr = &job_array[j];
 			debug2("cplex allocated job %d, bid %d, x: %.2f",sjob_ptr->job_id,k,x[k]);
+
+			// set jobs gpu to allocated number of gpus
+			List job_gres_list = sjob_ptr->job_ptr->gres_list;
+			if (job_gres_list != NULL) {
+				status = gres_job_gpu_set(job_gres_list, bids[k].gpu);
+				if (status)
+					fatal("problem setting gpu");
+			}
+
 			job_det_ptr = sjob_ptr->job_ptr->details;
 			sjob_ptr->node_bitmap = (bitstr_t *) 
 				bit_alloc (node_record_count);
@@ -1735,23 +1529,14 @@ extern int solve_allocation(int nodeSize, int windowSize, int timeout,
 				(sizeof(uint16_t) * node_record_count);
 			job_det_ptr->req_node_bitmap = (bitstr_t *) bit_alloc
 				(node_record_count);
-                        debug2("job %d has %d nodes",sjob_ptr->job_id,bids[k].lastNode - bids[k].firstNode);
+                        debug2("job %d has %d nodes",sjob_ptr->job_id,bids[k].lastNode - bids[k].firstNode + 1);
 			for (c = bids[k].firstNode; c < bids[k].lastNode; c++) {
 				i = jobNodeName[c];
-				debug3("setting node %d (c: %d) for job %d",i,c, sjob_ptr->job_id);
+				debug3("setting node %d (c: %d) for job %d to %d",i,c, sjob_ptr->job_id, T[c]);
 				bit_set (sjob_ptr->node_bitmap, (bitoff_t) (i));
 				bit_set (job_det_ptr->req_node_bitmap, (bitoff_t) (i));		
-				job_det_ptr->req_node_layout[i] = 1 + (uint16_t) (x[bidCtr + jobNodeIdx[c] + jobNodeCtr]);
-				if (x[bidCtr + jobNodeIdx[c] + jobNodeCtr] - floor(x[bidCtr + jobNodeIdx[c] + jobNodeCtr]) > 0.9) {
-				        dummy = dummy + 1 + (uint16_t) ceil(x[bidCtr + jobNodeIdx[c] + jobNodeCtr]);
-                                        job_det_ptr->req_node_layout[i] = 1 + (uint16_t) ceil(x[bidCtr + jobNodeIdx[c] + jobNodeCtr]);
-                                }
-                                else {
-   				        dummy = dummy + 1 + (uint16_t) floor(x[bidCtr + jobNodeIdx[c] + jobNodeCtr]);
-				        job_det_ptr->req_node_layout[i] = 1 + (uint16_t) floor(x[bidCtr + jobNodeIdx[c] + jobNodeCtr]);
-                                }
-                                debug3("set node above");
-
+				job_det_ptr->req_node_layout[i] = (uint16_t) (T[c]);
+				dummy += T[c];
                                 
 				//debug3("job %d has allocation in node %d : %.3f (u %d r %d) %u node rem: %d alloc now: %d",sjob_ptr->job_id,i,
 				        //(x[bidCtr + jobNodeIdx[c]]) + ceil(x[bidCtr + jobNodeIdx[c] + jobNodeCtr]),
@@ -1760,6 +1545,7 @@ extern int solve_allocation(int nodeSize, int windowSize, int timeout,
 			} 
 			sjob_ptr->alloc_total = dummy;
 			debug3("set alloc total to %d",dummy);
+
 		} 
 	} 
 	}
@@ -1803,7 +1589,8 @@ TERMINATE:
 			fatal("%s", errmsg);
 		}
 	}     
-	
+
+	debug("returning from solve_allocation");	
 	if (half)
 	        return 2;
 	

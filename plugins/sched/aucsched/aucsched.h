@@ -34,6 +34,7 @@ typedef struct select_nodeinfo {
 typedef struct sched_nodeinfo {
 	uint16_t rem_cpus;
 	uint16_t rem_gpus;
+	bool allocated;
 } sched_nodeinfo_t;
 
 extern char* get_cplex_license_address(void);
@@ -55,12 +56,14 @@ typedef struct solver_job_list {
 	uint32_t min_cpus;
 	uint32_t max_cpus;
 	uint32_t cpus_per_node;
+	bool	 exclusive;
 	uint32_t priority;
 	uint16_t alloc_total;
 	uint16_t *onnodes;
 	bitstr_t *node_bitmap;
 	uint16_t contiguous;
 	uint32_t gpu;
+	uint32_t gpu_max;
 	uint32_t firstBid;
 	uint32_t lastBid;
 } solver_job_list_t;
